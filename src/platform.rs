@@ -32,6 +32,8 @@ pub struct Shared {
     pub suspended: AtomicBool,
     /// Query to pre-fill the next time the window is shown (set by the clipboard hotkey).
     pub pending_query: Mutex<Option<String>>,
+    /// Remembered window position (top-left) after the user dragged it; `None` = centered.
+    pub saved_pos: Mutex<Option<(i32, i32)>>,
 }
 
 impl Shared {
@@ -48,6 +50,7 @@ impl Shared {
             clip_hotkey_error: Mutex::new(None),
             suspended: AtomicBool::new(false),
             pending_query: Mutex::new(None),
+            saved_pos: Mutex::new(None),
         })
     }
 }
@@ -371,7 +374,13 @@ mod imp {
             let mut rc = RECT::default();
             GetWindowRect(h, &mut rc);
             let (w, _) = (rc.right - rc.left, rc.bottom - rc.top);
-            if GetMonitorInfoW(mon, &mut mi) != 0 {
+            // A position the user chose by dragging wins, as long as it is still on some monitor
+            // (a monitor may have been unplugged since).
+            let saved = shared.saved_pos.lock().ok().and_then(|g| *g);
+            let on_screen = |(x, y): (i32, i32)| MonitorFromPoint(POINT { x: x + 40, y: y + 20 }, 0) != 0;
+            if let Some((x, y)) = saved.filter(|p| on_screen(*p)) {
+                SetWindowPos(h, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_SHOWWINDOW);
+            } else if GetMonitorInfoW(mon, &mut mi) != 0 {
                 let work = mi.rcWork;
                 let x = work.left + ((work.right - work.left) - w) / 2;
                 let y = work.top + (work.bottom - work.top) * 15 / 100;
@@ -382,6 +391,24 @@ mod imp {
         }
         shared.visible.store(true, Ordering::SeqCst);
         shared.just_shown.store(true, Ordering::SeqCst);
+    }
+
+    /// Current top-left of the window in screen pixels.
+    pub fn window_pos(shared: &Shared) -> Option<(i32, i32)> {
+        let h = find_main_hwnd(shared);
+        if h == 0 {
+            return None;
+        }
+        let mut rc = RECT::default();
+        (unsafe { GetWindowRect(h, &mut rc) } != 0).then_some((rc.left, rc.top))
+    }
+
+    /// Move the (visible) window back to the centered default position.
+    pub fn recenter_window(shared: &Shared) {
+        if let Ok(mut g) = shared.saved_pos.lock() {
+            *g = None;
+        }
+        show_window(shared);
     }
 
     pub fn hide_window(shared: &Shared) {
@@ -660,6 +687,14 @@ mod imp {
     pub fn show_window(shared: &Shared) {
         shared.visible.store(true, Ordering::SeqCst);
         shared.just_shown.store(true, Ordering::SeqCst);
+    }
+    pub fn window_pos(_shared: &Shared) -> Option<(i32, i32)> {
+        None
+    }
+    pub fn recenter_window(shared: &Shared) {
+        if let Ok(mut g) = shared.saved_pos.lock() {
+            *g = None;
+        }
     }
     pub fn hide_window(shared: &Shared) {
         shared.visible.store(false, Ordering::SeqCst);

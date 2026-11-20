@@ -97,6 +97,9 @@ enum HotkeyTarget {
     Clip,
 }
 
+/// (started at, window position at start, last polled position)
+type DragTrack = (Instant, (i32, i32), (i32, i32));
+
 pub struct App {
     shared: Arc<Shared>,
     engine: Engine,
@@ -128,6 +131,8 @@ pub struct App {
 
     // window state
     focus_frames: u8,
+    /// Set while the user drags the window: (started, position at start, last polled position).
+    drag: Option<DragTrack>,
     was_focused: bool,
     last_height: f32,
     positioned: bool,
@@ -293,6 +298,7 @@ impl App {
             last_scan: Instant::now(),
             scanning: false,
             focus_frames: 3,
+            drag: None,
             was_focused: false,
             last_height: 0.0,
             positioned: false,
@@ -447,6 +453,37 @@ impl App {
     }
 
     // ───────────────────────────── actions ─────────────────────────────
+
+    /// The OS runs its own move loop during a drag, so we cannot see the mouse release. Instead
+    /// we note the start and poll the window position until it stops changing.
+    fn begin_drag(&mut self) {
+        if let Some(p) = platform::window_pos(&self.shared) {
+            self.drag = Some((Instant::now(), p, p));
+        }
+    }
+
+    fn track_drag(&mut self, ctx: &egui::Context) {
+        let Some((started, start, prev)) = self.drag else { return };
+        let Some(cur) = platform::window_pos(&self.shared) else {
+            self.drag = None;
+            return;
+        };
+        if cur != start && cur == prev {
+            // Moved and now still: remember the new spot.
+            if let Ok(mut g) = self.shared.saved_pos.lock() {
+                *g = Some(cur);
+            }
+            self.engine.cfg.window_pos = Some(cur);
+            self.engine.cfg.save();
+            self.drag = None;
+            self.focus_frames = 3; // the drag took keyboard focus from the input box
+        } else if started.elapsed() > Duration::from_secs(20) {
+            self.drag = None;
+        } else {
+            self.drag = Some((started, start, cur));
+            ctx.request_repaint_after(Duration::from_millis(150));
+        }
+    }
 
     fn hide(&mut self) {
         if self.recording.is_some() {
@@ -882,6 +919,7 @@ impl App {
         let drag = ui.interact(icon_rect, egui::Id::new("drag_handle"), Sense::drag());
         if drag.drag_started() {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            self.begin_drag();
         }
         let c = icon_rect.center() + Vec2::new(-2.0, -2.0);
         ui.painter()
@@ -1259,7 +1297,15 @@ impl App {
             ui.label(egui::RichText::new("快捷键与行为").strong());
             self.hotkey_row(ui, HotkeyTarget::Main);
             let mut changed = false;
-            changed |= ui.checkbox(&mut self.engine.cfg.hide_on_blur, "失去焦点时自动隐藏").changed();
+            changed |= ui.checkbox(&mut self.engine.cfg.hide_on_blur, "失去焦点时自动隐藏 (设置面板打开时不会隐藏)").changed();
+            ui.horizontal(|ui| {
+                ui.label("拖动窗口任意空白处可移动位置，会被记住");
+                if ui.button("重置窗口位置").clicked() {
+                    self.engine.cfg.window_pos = None;
+                    platform::recenter_window(&self.shared);
+                    self.engine.cfg.save();
+                }
+            });
             changed |= ui.checkbox(&mut self.engine.cfg.dark_mode, "深色主题").changed();
             if ui.checkbox(&mut self.ui_autostart, "开机自启动").changed() {
                 platform::set_autostart(self.ui_autostart);
@@ -1530,6 +1576,7 @@ impl eframe::App for App {
                 self.hotkey_warned = true;
             }
         }
+        self.track_drag(ctx);
         self.handle_keys(ctx);
         self.send_search_if_needed();
         if self.dirty {
@@ -1542,6 +1589,7 @@ impl eframe::App for App {
             self.was_focused = true;
         } else if self.was_focused
             && self.engine.cfg.hide_on_blur
+            && !self.panel_open // settings stay open while you copy a path from another window
             && self.shared.visible.load(Ordering::SeqCst)
         {
             self.hide();
@@ -1561,6 +1609,12 @@ impl eframe::App for App {
             .corner_radius(CornerRadius::same(16))
             .inner_margin(egui::Margin::same(PAD as i8));
         egui::CentralPanel::default().frame(frame).show(root, |ui| {
+            // The whole window is a drag handle (widgets added later sit on top of it).
+            let bg = ui.interact(ui.max_rect(), egui::Id::new("window_drag_bg"), Sense::drag());
+            if bg.drag_started() {
+                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                self.begin_drag();
+            }
             if self.panel_open {
                 self.draw_panel(ui, ctx);
             } else {

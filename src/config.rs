@@ -61,6 +61,8 @@ pub struct Config {
     pub max_file_results: u32,
     /// Hide the window when it loses focus.
     pub hide_on_blur: bool,
+    /// Where the user dragged the window to (top-left, screen pixels). `None` = centered.
+    pub window_pos: Option<(i32, i32)>,
     /// Path prefixes that never appear in results.
     pub excluded_dirs: Vec<String>,
     pub show_settings: bool,
@@ -117,6 +119,7 @@ impl Default for Config {
             visible_rows: 8,
             max_file_results: 300,
             hide_on_blur: true,
+            window_pos: None,
             excluded_dirs: vec![
                 r"C:\$Recycle.Bin".into(),
                 r"C:\Windows\WinSxS".into(),

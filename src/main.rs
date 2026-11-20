@@ -33,6 +33,9 @@ fn main() -> eframe::Result {
 
     let cfg = config::Config::load();
     let shared = platform::Shared::new(&cfg.hotkey, &cfg.clipboard_hotkey, !background);
+    if let Ok(mut g) = shared.saved_pos.lock() {
+        *g = cfg.window_pos;
+    }
 
     let viewport = eframe::egui::ViewportBuilder::default()
         .with_title(platform::WINDOW_TITLE)
