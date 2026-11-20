@@ -118,6 +118,11 @@ fn file_base_score(path: &str, lp: &str, is_folder: bool, tokens: &[&str]) -> f3
     s
 }
 
+/// How good a file match is, 0..=1, from `file_base_score` (range roughly 8..65).
+fn file_quality(score: f32) -> f32 {
+    ((score - 8.0) / 57.0).clamp(0.0, 1.0)
+}
+
 fn parent(path: &str) -> &str {
     match path.rfind(['\\', '/']) {
         Some(i) if i > 0 => &path[..i],
@@ -409,7 +414,7 @@ impl Engine {
         let now = now_secs();
         let q = query.trim();
         if q.is_empty() {
-            return self.frequent(now);
+            return if self.cfg.show_recent_on_empty { self.frequent(now) } else { Vec::new() };
         }
         if let Some(items) = self.clipboard_view(q) {
             return items;
@@ -491,6 +496,7 @@ impl Engine {
             let Some(mut s) = matcher::score(&l.hay, &tokens) else {
                 continue;
             };
+            let quality = (s / 85.0).min(1.0); // text-match strength, before priors/bonuses
             if l.trigger.as_deref() == Some(qn.as_str()) {
                 s += 60.0; // exact trigger word, e.g. "cmd"
             }
@@ -501,7 +507,7 @@ impl Engine {
                 _ => 0.0,
             };
             let mut it = l.item.clone();
-            it.score = s + self.learner.boost(&it.id, &qn, now);
+            it.score = s + self.learner.boost(&it.id, &qn, now, quality);
             out.push(it);
         }
 
@@ -516,7 +522,7 @@ impl Engine {
                 }
                 let s = file_base_score(path, &l.item.id, false, &tokens);
                 let mut it = l.item.clone();
-                it.score = s + self.learner.boost(&it.id, &qn, now);
+                it.score = s + self.learner.boost(&it.id, &qn, now, file_quality(s));
                 out.push(it);
             }
         }
@@ -535,7 +541,7 @@ impl Engine {
                 let name = basename(&h.path);
                 let s = file_base_score(&h.path, &lp, h.is_folder, &tokens);
                 let id = lp;
-                let boost = self.learner.boost(&id, &qn, now);
+                let boost = self.learner.boost(&id, &qn, now, file_quality(s));
                 out.push(Item {
                     id,
                     title: name.to_string(),
@@ -768,8 +774,10 @@ mod tests {
     }
 
     #[test]
-    fn empty_query_shows_frequent() {
+    fn empty_query_shows_frequent_only_when_enabled() {
         let mut e = engine();
+        assert!(e.results("", &[], true).is_empty(), "clean search bar by default");
+        e.cfg.show_recent_on_empty = true;
         let r = e.results("vis", &[], true);
         e.learn(&r[0], "vis", &[]);
         let f = e.results("", &[], true);

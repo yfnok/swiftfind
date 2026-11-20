@@ -133,6 +133,8 @@ pub struct App {
     focus_frames: u8,
     /// Set while the user drags the window: (started, position at start, last polled position).
     drag: Option<DragTrack>,
+    /// A fresh mouse press happened and has not started a window drag yet.
+    drag_armed: bool,
     was_focused: bool,
     last_height: f32,
     positioned: bool,
@@ -299,6 +301,7 @@ impl App {
             scanning: false,
             focus_frames: 3,
             drag: None,
+            drag_armed: false,
             was_focused: false,
             last_height: 0.0,
             positioned: false,
@@ -459,6 +462,32 @@ impl App {
     fn begin_drag(&mut self) {
         if let Some(p) = platform::window_pos(&self.shared) {
             self.drag = Some((Instant::now(), p, p));
+        }
+    }
+
+    /// Dragging works from *anywhere* in the window, except where the drag already means
+    /// something else (selecting text, moving a slider or scrollbar). An empty search box has no
+    /// text to select, so it drags the window too.
+    fn window_drag(&mut self, ctx: &egui::Context) {
+        let (pressed, down, dragging) =
+            ctx.input(|i| (i.pointer.primary_pressed(), i.pointer.primary_down(), i.pointer.is_decidedly_dragging()));
+        if pressed {
+            self.drag_armed = true;
+        }
+        if !down {
+            self.drag_armed = false;
+        }
+        if !(self.drag_armed && dragging) {
+            return;
+        }
+        let taken = match ctx.dragged_id() {
+            None => false,
+            Some(id) => !(id == egui::Id::new("query") && self.query.is_empty()),
+        };
+        if !taken {
+            self.drag_armed = false; // the OS move loop swallows the release; re-arm on next press
+            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            self.begin_drag();
         }
     }
 
@@ -901,7 +930,7 @@ impl App {
         if rows == 0 && self.query.trim().is_empty() {
             return HEADER_H + PAD;
         }
-        HEADER_H + (rows.max(1) as f32) * ROW_H + FOOTER_H + PAD * 1.5
+        HEADER_H + (rows.max(1) as f32) * ROW_H + FOOTER_H + PAD * 1.5 + 14.0 // + widget spacing; was clipping the status line
     }
 
     fn draw_header(&mut self, ui: &mut egui::Ui) {
@@ -916,11 +945,6 @@ impl App {
 
         // Magnifier glyph doubles as the drag handle for the borderless window.
         let icon_rect = Rect::from_min_size(input_rect.min, Vec2::new(48.0, input_rect.height()));
-        let drag = ui.interact(icon_rect, egui::Id::new("drag_handle"), Sense::drag());
-        if drag.drag_started() {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-            self.begin_drag();
-        }
         let c = icon_rect.center() + Vec2::new(-2.0, -2.0);
         ui.painter()
             .circle_stroke(c, 8.0, Stroke::new(2.2, p.accent));
@@ -1299,7 +1323,7 @@ impl App {
             let mut changed = false;
             changed |= ui.checkbox(&mut self.engine.cfg.hide_on_blur, "失去焦点时自动隐藏 (设置面板打开时不会隐藏)").changed();
             ui.horizontal(|ui| {
-                ui.label("拖动窗口任意空白处可移动位置，会被记住");
+                ui.label("按住窗口任意位置拖动即可移动（选文字、拖滑块除外），位置会被记住");
                 if ui.button("重置窗口位置").clicked() {
                     self.engine.cfg.window_pos = None;
                     platform::recenter_window(&self.shared);
@@ -1307,6 +1331,10 @@ impl App {
                 }
             });
             changed |= ui.checkbox(&mut self.engine.cfg.dark_mode, "深色主题").changed();
+            if ui.checkbox(&mut self.engine.cfg.show_recent_on_empty, "输入为空时显示常用项目 (默认关闭，只显示搜索框)").changed() {
+                changed = true;
+                self.dirty = true;
+            }
             if ui.checkbox(&mut self.ui_autostart, "开机自启动").changed() {
                 platform::set_autostart(self.ui_autostart);
             }
@@ -1609,12 +1637,6 @@ impl eframe::App for App {
             .corner_radius(CornerRadius::same(16))
             .inner_margin(egui::Margin::same(PAD as i8));
         egui::CentralPanel::default().frame(frame).show(root, |ui| {
-            // The whole window is a drag handle (widgets added later sit on top of it).
-            let bg = ui.interact(ui.max_rect(), egui::Id::new("window_drag_bg"), Sense::drag());
-            if bg.drag_started() {
-                ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                self.begin_drag();
-            }
             if self.panel_open {
                 self.draw_panel(ui, ctx);
             } else {
@@ -1627,6 +1649,8 @@ impl eframe::App for App {
                 }
             }
         });
+
+        self.window_drag(ctx);
 
         if let Some((_, t)) = &self.toast {
             if t.elapsed() < Duration::from_secs(3) {
