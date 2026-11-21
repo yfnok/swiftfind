@@ -12,8 +12,9 @@ pub fn log_path() -> PathBuf {
     crate::config::data_dir().join("swiftfind.log")
 }
 
-/// `YYYY-MM-DD HH:MM:SS` (UTC) from Unix seconds. Civil-from-days algorithm (H. Hinnant).
-pub fn format_utc(secs: u64) -> String {
+/// (year, month, day, hour, minute, second) in UTC from Unix seconds.
+/// Civil-from-days algorithm (H. Hinnant).
+pub fn civil(secs: u64) -> (i32, u32, u32, u32, u32, u32) {
     let days = (secs / 86_400) as i64;
     let rem = secs % 86_400;
     let z = days + 719_468;
@@ -25,12 +26,13 @@ pub fn format_utc(secs: u64) -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = yoe + era * 400 + if m <= 2 { 1 } else { 0 };
-    format!(
-        "{y:04}-{m:02}-{d:02} {:02}:{:02}:{:02}",
-        rem / 3600,
-        rem % 3600 / 60,
-        rem % 60
-    )
+    (y as i32, m as u32, d as u32, (rem / 3600) as u32, (rem % 3600 / 60) as u32, (rem % 60) as u32)
+}
+
+/// `YYYY-MM-DD HH:MM:SS` (UTC) from Unix seconds.
+pub fn format_utc(secs: u64) -> String {
+    let (y, m, d, h, mi, s) = civil(secs);
+    format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}")
 }
 
 pub fn write_to(path: &std::path::Path, msg: &str) {

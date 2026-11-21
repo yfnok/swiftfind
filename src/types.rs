@@ -10,6 +10,7 @@ pub enum Kind {
     Calc,
     Web,
     Clip,
+    Snippet,
 }
 
 impl Kind {
@@ -23,6 +24,7 @@ impl Kind {
             Kind::Calc => "计算",
             Kind::Web => "网页",
             Kind::Clip => "剪贴板",
+            Kind::Snippet => "片段",
         }
     }
 }
@@ -40,6 +42,8 @@ pub enum Action {
     Copy(String),
     /// Paste a clipboard-history item (text or image) into the previously active window.
     PasteClip { id: i64, image: bool },
+    /// Paste a text snippet (variables like `{date}` are expanded at paste time).
+    PasteText(String),
     /// Quit the app.
     Quit,
     /// Open this app's settings panel.

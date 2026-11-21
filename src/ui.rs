@@ -78,6 +78,7 @@ fn kind_color(k: Kind) -> Color32 {
         Kind::Calc => Color32::from_rgb(167, 139, 250),
         Kind::Web => Color32::from_rgb(244, 114, 182),
         Kind::Clip => Color32::from_rgb(110, 205, 130),
+        Kind::Snippet => Color32::from_rgb(250, 204, 21),
     }
 }
 
@@ -126,6 +127,9 @@ pub struct App {
     // Apps
     apps_rx: Receiver<Vec<AppEntry>>,
     apps_tx: Sender<Vec<AppEntry>>,
+    bm_rx: Receiver<Vec<crate::bookmarks::Bookmark>>,
+    bm_tx: Sender<Vec<crate::bookmarks::Bookmark>>,
+    last_bm_load: Instant,
     last_scan: Instant,
     scanning: bool,
 
@@ -281,6 +285,7 @@ impl App {
 
         // App scanner (background).
         let (apps_tx, apps_rx) = channel();
+        let (bm_tx, bm_rx) = channel();
         let mut app = Self {
             shared: shared.clone(),
             engine,
@@ -302,6 +307,9 @@ impl App {
             ev_ok: false,
             apps_rx,
             apps_tx,
+            bm_rx,
+            bm_tx,
+            last_bm_load: Instant::now(),
             last_scan: Instant::now(),
             scanning: false,
             focus_frames: 3,
@@ -332,6 +340,7 @@ impl App {
             toast: None,
         };
         app.start_scan(&ctx);
+        app.load_bookmarks(&ctx);
         if let Some(e) = clip_error {
             app.toast(e);
         }
@@ -357,6 +366,20 @@ impl App {
         });
     }
 
+    /// Re-read browser bookmarks on a helper thread (cheap, but it touches the disk).
+    fn load_bookmarks(&mut self, ctx: &egui::Context) {
+        if !self.engine.cfg.show_bookmarks {
+            return;
+        }
+        self.last_bm_load = Instant::now();
+        let tx = self.bm_tx.clone();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::bookmarks::load_all());
+            ctx.request_repaint();
+        });
+    }
+
     fn toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), Instant::now()));
     }
@@ -364,6 +387,9 @@ impl App {
     // ───────────────────────────── state updates ─────────────────────────────
 
     fn on_shown(&mut self, ctx: &egui::Context) {
+        if self.last_bm_load.elapsed() > Duration::from_secs(120) {
+            self.load_bookmarks(ctx);
+        }
         if self.recording.is_some() {
             self.stop_recording();
         }
@@ -394,6 +420,10 @@ impl App {
     }
 
     fn poll_channels(&mut self) {
+        while let Ok(list) = self.bm_rx.try_recv() {
+            self.engine.set_bookmarks(list);
+            self.dirty = true;
+        }
         while let Ok(apps) = self.apps_rx.try_recv() {
             self.scanning = false;
             self.engine.rebuild(&apps);
@@ -429,7 +459,7 @@ impl App {
         self.user_moved = false;
         self.selected = 0;
         self.dirty = true;
-        if q.is_empty() || !self.engine.cfg.show_files || self.is_clip_query(&q) || crate::pathnav::is_path_query(&q) || crate::recent::trigger(&q).is_some() {
+        if q.is_empty() || !self.engine.cfg.show_files || self.is_clip_query(&q) || crate::pathnav::is_path_query(&q) || crate::recent::trigger(&q).is_some() || q.trim_start().starts_with('>') {
             self.files.clear();
             self.files_query.clear();
             return;
@@ -695,6 +725,15 @@ impl App {
                         }
                     }
                     None => self.toast("该记录已不存在"),
+                }
+            }
+            Action::PasteText(text) => {
+                let c = ClipContent::Text(crate::snippets::expand(text, platform::local_now()));
+                self.engine.learn(&item, &query, &skipped);
+                if platform::paste_clip(&c) {
+                    self.hide();
+                } else {
+                    self.copy_clip(ctx, c);
                 }
             }
             Action::Quit => std::process::exit(0),
@@ -1373,6 +1412,7 @@ impl App {
         let nav = crate::pathnav::is_path_query(&self.query);
         let hint = match self.results.get(self.selected).map(|i| i.kind) {
             Some(Kind::File | Kind::Folder) if nav => "Tab/→ 补全 · Alt+← 上一级 · Enter 打开 · Shift+Enter 所在文件夹",
+            Some(Kind::Snippet) => "Enter 粘贴到之前的窗口",
             Some(Kind::Clip) => "Enter 粘贴 · Shift+Enter 仅复制 · Ctrl+P 置顶 · Ctrl+Delete 删除",
             Some(Kind::File | Kind::Folder) => {
                 "Enter 打开 · Ctrl+Enter 管理员 · Shift+Enter 所在文件夹 · Ctrl+T 终端"
@@ -1447,6 +1487,7 @@ impl App {
             ui.horizontal(|ui| {
                 changed |= ui.checkbox(&mut self.engine.cfg.show_files, "搜索文件").changed();
                 changed |= ui.checkbox(&mut self.engine.cfg.show_apps, "搜索应用").changed();
+                changed |= ui.checkbox(&mut self.engine.cfg.show_bookmarks, "搜索浏览器书签").changed();
                 changed |= ui.checkbox(&mut self.engine.cfg.show_settings, "搜索 Windows 设置").changed();
             });
             if changed {

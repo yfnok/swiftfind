@@ -3,6 +3,7 @@
 //! on other OSes the functions are harmless stubs so the rest of the crate builds and tests.
 
 use crate::clipdb::ClipContent;
+use crate::snippets::LocalTime;
 use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -308,6 +309,13 @@ mod imp {
 
     /// Put `c` on the clipboard and send Ctrl+V to whichever window gets focus once the
     /// launcher is hidden. Call this *before* hiding the window.
+    /// Current local date and time (the user's time zone).
+    pub fn local_now() -> LocalTime {
+        let mut t = SYSTEMTIME::default();
+        unsafe { GetLocalTime(&mut t) };
+        LocalTime { year: t.wYear as i32, month: t.wMonth as u32, day: t.wDay as u32, hour: t.wHour as u32, minute: t.wMinute as u32, second: t.wSecond as u32 }
+    }
+
     pub fn paste_clip(c: &ClipContent) -> bool {
         if !set_clip(c) {
             return false;
@@ -683,6 +691,12 @@ mod imp {
     }
     pub fn paste_clip(_c: &ClipContent) -> bool {
         false
+    }
+    /// Other platforms: UTC (the real implementation uses the Windows time zone).
+    pub fn local_now() -> LocalTime {
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let (year, month, day, hour, minute, second) = crate::log::civil(secs);
+        LocalTime { year, month, day, hour, minute, second }
     }
     pub fn show_window(shared: &Shared) {
         shared.visible.store(true, Ordering::SeqCst);

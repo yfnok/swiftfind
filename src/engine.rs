@@ -9,6 +9,7 @@ use crate::everything::FileHit;
 use crate::learn::{normalize_query, Learner};
 use crate::matcher::{self, Haystack};
 use crate::settings_db::SETTINGS;
+use crate::bookmarks::{self, Bookmark};
 use crate::pathnav::{self, NavEntry, NAV_SCORE_BASE};
 use crate::recent::{self, Recent};
 use crate::types::{Action, Item, Kind};
@@ -33,6 +34,9 @@ pub struct Engine {
     /// the real database).
     pub clip: Store,
     locals: Vec<Local>,
+    /// Last app list and bookmark list, kept so either can be refreshed on its own.
+    apps: Vec<AppEntry>,
+    bookmarks: Vec<Bookmark>,
     /// Files/folders the user launched before: always candidates, even when Everything's
     /// (limited) result window does not contain them.
     learned: Vec<Local>,
@@ -48,6 +52,7 @@ pub enum Scope {
     Files,
     Apps,
     Settings,
+    Bookmarks,
 }
 
 impl Scope {
@@ -56,14 +61,16 @@ impl Scope {
             Scope::Files => "仅文件",
             Scope::Apps => "仅应用",
             Scope::Settings => "仅设置",
+            Scope::Bookmarks => "仅书签",
         }
     }
 
-    fn allows(self, k: Kind) -> bool {
+    fn allows(self, item: &Item) -> bool {
         match self {
-            Scope::Files => matches!(k, Kind::File | Kind::Folder),
-            Scope::Apps => k == Kind::App,
-            Scope::Settings => k == Kind::Setting,
+            Scope::Files => matches!(item.kind, Kind::File | Kind::Folder),
+            Scope::Apps => item.kind == Kind::App,
+            Scope::Settings => item.kind == Kind::Setting,
+            Scope::Bookmarks => item.id.starts_with("bm:"),
         }
     }
 }
@@ -155,6 +162,23 @@ fn file_base_score(path: &str, lp: &str, is_folder: bool, tokens: &[&str]) -> f3
     s
 }
 
+/// `> ipconfig /all` runs the text in a command prompt that stays open. The whole command is
+/// wrapped in one more pair of quotes, which is how `cmd /k` keeps quoted paths intact.
+fn run_command_item(cmd: &str) -> Option<Item> {
+    if cmd.is_empty() {
+        return None;
+    }
+    Some(Item {
+        id: format!("run:{}", cmd.to_lowercase()),
+        title: format!("运行: {cmd}"),
+        subtitle: "在命令提示符中执行 (Ctrl+Enter 以管理员身份)".into(),
+        kind: Kind::Command,
+        action: Action::Open { target: "cmd.exe".into(), args: format!("/k \"{cmd}\""), admin: false, cwd: None },
+        path: None,
+        score: NAV_SCORE_BASE,
+    })
+}
+
 /// How good a file match is, 0..=1, from `file_base_score` (range roughly 8..65).
 fn file_quality(score: f32) -> f32 {
     ((score - 8.0) / 57.0).clamp(0.0, 1.0)
@@ -175,6 +199,8 @@ impl Engine {
             learner,
             clip,
             locals: Vec::new(),
+            apps: Vec::new(),
+            bookmarks: Vec::new(),
             learned: Vec::new(),
             learned_ids: HashSet::new(),
             nav_cache: Mutex::new(None),
@@ -291,8 +317,22 @@ impl Engine {
 
     /// Rebuild the local index (call after config changes or a fresh app scan).
     pub fn rebuild(&mut self, apps: &[AppEntry]) {
-        let mut v: Vec<Local> =
-            Vec::with_capacity(SETTINGS.len() + apps.len() + self.cfg.commands.len());
+        self.apps = apps.to_vec();
+        self.rebuild_locals();
+    }
+
+    /// New bookmark list (loaded in the background); rebuilds the searchable items.
+    pub fn set_bookmarks(&mut self, list: Vec<Bookmark>) {
+        if list != self.bookmarks {
+            self.bookmarks = list;
+            self.rebuild_locals();
+        }
+    }
+
+    fn rebuild_locals(&mut self) {
+        let mut v: Vec<Local> = Vec::with_capacity(
+            SETTINGS.len() + self.apps.len() + self.bookmarks.len() + self.cfg.commands.len(),
+        );
 
         if self.cfg.show_settings {
             for d in SETTINGS {
@@ -314,7 +354,7 @@ impl Engine {
         }
 
         if self.cfg.show_apps {
-            for a in apps {
+            for a in &self.apps {
                 let id = if a.uwp {
                     format!("app:{}", a.target.to_lowercase())
                 } else {
@@ -343,6 +383,43 @@ impl Engine {
                     trigger: None,
                 });
             }
+        }
+
+        if self.cfg.show_bookmarks {
+            for b in &self.bookmarks {
+                v.push(Local {
+                    item: Item {
+                        id: format!("bm:{}", b.url.to_lowercase()),
+                        title: b.title.clone(),
+                        subtitle: b.url.clone(),
+                        kind: Kind::Web,
+                        action: Action::Open { target: b.url.clone(), args: String::new(), admin: false, cwd: None },
+                        path: None,
+                        score: 0.0,
+                    },
+                    hay: Haystack::new(&b.title, &format!("{} {} {}", bookmarks::host(&b.url), b.folder, crate::py::keywords(&b.title))),
+                    trigger: None,
+                });
+            }
+        }
+
+        for s in &self.cfg.snippets {
+            if s.name.trim().is_empty() || s.text.is_empty() {
+                continue;
+            }
+            v.push(Local {
+                item: Item {
+                    id: format!("snip:{}", s.name.to_lowercase()),
+                    title: s.name.clone(),
+                    subtitle: crate::snippets::preview(&s.text),
+                    kind: Kind::Snippet,
+                    action: Action::PasteText(s.text.clone()),
+                    path: None,
+                    score: 0.0,
+                },
+                hay: Haystack::new(&s.name, &format!("{} {}", s.keywords.join(" "), crate::py::keywords(&s.name))),
+                trigger: Some(s.name.to_lowercase()),
+            });
         }
 
         for c in &self.cfg.commands {
@@ -553,6 +630,7 @@ impl Engine {
             "f" => Scope::Files,
             "a" => Scope::Apps,
             "s" => Scope::Settings,
+            "b" => Scope::Bookmarks,
             _ => return None,
         };
         let taken = self.cfg.commands.iter().any(|c| c.name.eq_ignore_ascii_case(head))
@@ -563,13 +641,16 @@ impl Engine {
     pub fn results(&self, query: &str, files: &[FileHit], files_fresh: bool) -> Vec<Item> {
         if let Some((scope, rest)) = self.split_scope(query) {
             let mut r = self.results(rest, files, files_fresh);
-            r.retain(|i| scope.allows(i.kind));
+            r.retain(|i| scope.allows(i));
             return r;
         }
         let now = now_secs();
         let q = query.trim();
         if q.is_empty() {
             return if self.cfg.show_recent_on_empty { self.frequent(now) } else { Vec::new() };
+        }
+        if let Some(cmd) = q.strip_prefix('>') {
+            return run_command_item(cmd.trim()).into_iter().collect();
         }
         if let Some(items) = self.path_view(q) {
             return items;
@@ -886,6 +967,59 @@ mod tests {
         // A user-defined command called "a" keeps its meaning.
         e.cfg.commands.push(crate::config::CustomCommand { name: "a".into(), ..e.cfg.commands[0].clone() });
         assert!(e.split_scope("a chrome").is_none());
+    }
+
+    #[test]
+    fn greater_than_runs_a_command_and_is_never_learned() {
+        let mut e = engine();
+        let r = e.results(r#"> "C:\Program Files\x.exe" -v"#, &[], true);
+        assert_eq!(r.len(), 1);
+        match &r[0].action {
+            Action::Open { target, args, .. } => {
+                assert_eq!(target, "cmd.exe");
+                assert_eq!(args, r#"/k ""C:\Program Files\x.exe" -v""#);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(r[0].can_run_admin());
+        assert!(e.results(">", &[], true).is_empty() && e.results(">   ", &[], true).is_empty());
+        let n = e.learner.len();
+        e.learn(&r[0], "> ping", &[]);
+        assert_eq!(e.learner.len(), n);
+    }
+
+    #[test]
+    fn bookmarks_are_searchable_by_title_host_folder_and_scope() {
+        let mut e = engine();
+        e.set_bookmarks(vec![
+            Bookmark { title: "掘金".into(), url: "https://juejin.cn/".into(), folder: "书签栏 › 技术".into() },
+            Bookmark { title: "Rust 文档".into(), url: "https://doc.rust-lang.org/book/".into(), folder: "书签栏".into() },
+        ]);
+        for q in ["掘金", "juejin", "jj", "技术"] {
+            let r = e.results(q, &[], true);
+            assert!(r.iter().take(3).any(|i| i.title == "掘金"), "{q}");
+        }
+        let r = e.results("b rust", &[], true);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].title, "Rust 文档");
+        assert!(matches!(&r[0].action, Action::Open { target, .. } if target == "https://doc.rust-lang.org/book/"));
+        e.cfg.show_bookmarks = false;
+        e.rebuild(&[]);
+        assert!(e.results("b rust", &[], true).is_empty());
+    }
+
+    #[test]
+    fn snippets_are_found_by_name_keyword_and_pinyin_and_paste_text() {
+        let mut e = engine();
+        e.cfg.snippets = vec![crate::config::Snippet { name: "公司邮箱".into(), text: "me@corp.com\n第二行".into(), keywords: vec!["mail".into()] }];
+        e.rebuild(&[]);
+        for q in ["公司邮箱", "mail", "gsyx"] {
+            let r = e.results(q, &[], true);
+            assert_eq!(r[0].kind, Kind::Snippet, "{q}");
+        }
+        let r = e.results("mail", &[], true);
+        assert!(matches!(&r[0].action, Action::PasteText(t) if t.starts_with("me@corp.com")));
+        assert_eq!(r[0].subtitle, "me@corp.com…");
     }
 
     #[test]

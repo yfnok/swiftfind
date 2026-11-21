@@ -3,6 +3,27 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+#[serde(default)]
+pub struct Snippet {
+    pub name: String,
+    pub text: String,
+    /// Extra words that also find this snippet.
+    pub keywords: Vec<String>,
+}
+
+fn snippet(name: &str, text: &str, kw: &[&str]) -> Snippet {
+    Snippet { name: name.into(), text: text.into(), keywords: kw.iter().map(|s| s.to_string()).collect() }
+}
+
+/// Built-in examples; they also show how the feature works.
+pub fn default_snippets() -> Vec<Snippet> {
+    vec![
+        snippet("日期", "{date}", &["date", "today", "rq", "今天"]),
+        snippet("时间", "{datetime}", &["time", "now", "sj", "现在"]),
+    ]
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct CustomCommand {
     /// Trigger word typed in the search box (e.g. `cmd`).
@@ -73,8 +94,12 @@ pub struct Config {
     pub show_settings: bool,
     pub show_apps: bool,
     pub show_files: bool,
+    /// Search Chrome/Edge/Brave/Vivaldi bookmarks.
+    pub show_bookmarks: bool,
     pub dark_mode: bool,
     pub commands: Vec<CustomCommand>,
+    /// Text snippets: `name` pastes `text` (with `{date}`-style variables) into the previous window.
+    pub snippets: Vec<Snippet>,
     pub web_searches: Vec<WebSearch>,
 }
 
@@ -134,6 +159,8 @@ impl Default for Config {
             ],
             show_settings: true,
             show_apps: true,
+            show_bookmarks: true,
+            snippets: default_snippets(),
             show_files: true,
             dark_mode: true,
             commands: vec![
@@ -366,9 +393,11 @@ fn zero() -> u32 {
 }
 
 /// Bump when new built-in commands are added; `migrate` hands them to existing configs once.
-const DEFAULTS_VERSION: u32 = 1;
+const DEFAULTS_VERSION: u32 = 2;
 /// Commands introduced by each version (index 0 = version 1).
-const NEW_COMMANDS: &[&[&str]] = &[&["hibernate", "shot", "darkmode"]];
+const NEW_COMMANDS: &[&[&str]] = &[&["hibernate", "shot", "darkmode"], &[]];
+/// Snippets introduced by each version (index 0 = version 1).
+const NEW_SNIPPETS: &[&[&str]] = &[&[], &["日期", "时间"]];
 
 impl Config {
     /// Give an older config the built-in commands added since it was written — once, and only
@@ -384,6 +413,16 @@ impl Config {
                 if !self.commands.iter().any(|c| c.name.eq_ignore_ascii_case(name)) {
                     if let Some(d) = defaults.iter().find(|c| c.name == *name) {
                         self.commands.push(d.clone());
+                    }
+                }
+            }
+        }
+        let default_snippets = default_snippets();
+        for names in NEW_SNIPPETS.iter().skip(self.defaults_version as usize) {
+            for name in *names {
+                if !self.snippets.iter().any(|s| s.name == *name) {
+                    if let Some(d) = default_snippets.iter().find(|s| s.name == *name) {
+                        self.snippets.push(d.clone());
                     }
                 }
             }

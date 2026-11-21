@@ -51,6 +51,19 @@ pub struct RECT {
 }
 
 #[repr(C)]
+#[derive(Default)]
+pub struct SYSTEMTIME {
+    pub wYear: u16,
+    pub wMonth: u16,
+    pub wDayOfWeek: u16,
+    pub wDay: u16,
+    pub wHour: u16,
+    pub wMinute: u16,
+    pub wSecond: u16,
+    pub wMilliseconds: u16,
+}
+
+#[repr(C)]
 pub struct SHFILEINFOW {
     pub hIcon: isize,
     pub iIcon: i32,
@@ -239,6 +252,7 @@ extern "system" {
 
 #[link(name = "kernel32")]
 extern "system" {
+    pub fn GetLocalTime(t: *mut SYSTEMTIME);
     pub fn GetModuleHandleW(name: *const u16) -> isize;
     pub fn GetCurrentThreadId() -> u32;
     pub fn SetProcessWorkingSetSize(process: isize, min: usize, max: usize) -> i32;

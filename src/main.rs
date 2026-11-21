@@ -4,6 +4,7 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod apps;
+mod bookmarks;
 mod calc;
 mod clipboard;
 mod clipdb;
@@ -17,6 +18,7 @@ mod learn;
 mod log;
 mod pathnav;
 mod py;
+mod snippets;
 mod recent;
 mod matcher;
 mod platform;
