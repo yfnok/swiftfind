@@ -418,7 +418,7 @@ impl App {
         self.user_moved = false;
         self.selected = 0;
         self.dirty = true;
-        if q.is_empty() || !self.engine.cfg.show_files || self.is_clip_query(&q) {
+        if q.is_empty() || !self.engine.cfg.show_files || self.is_clip_query(&q) || crate::pathnav::is_path_query(&q) || crate::recent::trigger(&q).is_some() {
             self.files.clear();
             self.files_query.clear();
             return;
@@ -782,6 +782,10 @@ impl App {
         let mut copy_sel = false;
         let mut pin_sel = false;
         let mut moved: Option<i32> = None;
+        let mut nav_complete = false;
+        let mut nav_up = false;
+        let nav_mode = crate::pathnav::is_path_query(&self.query);
+        let caret_at_end = self.caret_at_end(ctx);
 
         ctx.input_mut(|i| {
             if i.consume_key(Modifiers::CTRL, Key::Comma) {
@@ -802,6 +806,17 @@ impl App {
                 || i.consume_key(Modifiers::CTRL, Key::K)
             {
                 moved = Some(-1);
+            }
+            // Path browsing: Tab (or →, with the caret at the end) accepts the selected entry;
+            // Alt+← goes up a level. Tab is always consumed so it can never steal focus.
+            if i.consume_key(Modifiers::NONE, Key::Tab) {
+                nav_complete = nav_mode;
+            }
+            if nav_mode && caret_at_end && i.consume_key(Modifiers::NONE, Key::ArrowRight) {
+                nav_complete = true;
+            }
+            if nav_mode && i.consume_key(Modifiers::ALT, Key::ArrowLeft) {
+                nav_up = true;
             }
             if i.consume_key(Modifiers::NONE, Key::PageDown) {
                 moved = Some(8);
@@ -865,6 +880,19 @@ impl App {
                 self.scroll_to_selected = true;
             }
         }
+        if nav_complete {
+            if let Some(it) = self.results.get(self.selected) {
+                if it.subtitle != crate::engine::OPEN_DIR_SUBTITLE && it.id != "nav:slow" {
+                    let text = crate::pathnav::complete(&self.query, &it.title, it.kind == Kind::Folder);
+                    self.set_query(ctx, text);
+                }
+            }
+        }
+        if nav_up {
+            if let Some(text) = crate::pathnav::parent_query(&self.query) {
+                self.set_query(ctx, text);
+            }
+        }
         if let Some((idx, mode)) = act {
             self.activate(ctx, idx, mode);
         }
@@ -892,6 +920,24 @@ impl App {
                 self.hide();
             }
         }
+    }
+
+    /// Replace the search text and put the caret at its end.
+    fn set_query(&mut self, ctx: &egui::Context, text: String) {
+        let id = egui::Id::new("query");
+        let end = text.chars().count();
+        self.query = text;
+        let mut state = egui::text_edit::TextEditState::load(ctx, id).unwrap_or_default();
+        state.cursor.set_char_range(Some(egui::text::CCursorRange::one(egui::text::CCursor::new(end))));
+        state.store(ctx, id);
+        self.focus_frames = self.focus_frames.max(1);
+    }
+
+    fn caret_at_end(&self, ctx: &egui::Context) -> bool {
+        let end = self.query.chars().count();
+        egui::text_edit::TextEditState::load(ctx, egui::Id::new("query"))
+            .and_then(|s| s.cursor.char_range())
+            .is_none_or(|r| r.primary.index.0 >= end && r.secondary.index.0 >= end)
     }
 
     fn pin_selected(&mut self) {
@@ -1266,7 +1312,9 @@ impl App {
             FontId::proportional(12.0),
             col,
         );
+        let nav = crate::pathnav::is_path_query(&self.query);
         let hint = match self.results.get(self.selected).map(|i| i.kind) {
+            Some(Kind::File | Kind::Folder) if nav => "Tab/→ 补全 · Alt+← 上一级 · Enter 打开 · Shift+Enter 所在文件夹",
             Some(Kind::Clip) => "Enter 粘贴 · Shift+Enter 仅复制 · Ctrl+P 置顶 · Ctrl+Delete 删除",
             Some(Kind::File | Kind::Folder) => {
                 "Enter 打开 · Ctrl+Enter 管理员 · Shift+Enter 所在文件夹 · Ctrl+T 终端"

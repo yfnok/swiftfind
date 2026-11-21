@@ -9,8 +9,13 @@ use crate::everything::FileHit;
 use crate::learn::{normalize_query, Learner};
 use crate::matcher::{self, Haystack};
 use crate::settings_db::SETTINGS;
+use crate::pathnav::{self, NavEntry, NAV_SCORE_BASE};
+use crate::recent::{self, Recent};
 use crate::types::{Action, Item, Kind};
 use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 pub const MAX_RESULTS: usize = 60;
 
@@ -32,7 +37,13 @@ pub struct Engine {
     /// (limited) result window does not contain them.
     learned: Vec<Local>,
     learned_ids: HashSet<String>,
+    /// Last folder listing for path browsing (re-reading a big folder on every key is wasteful).
+    nav_cache: Mutex<Option<(PathBuf, Instant, Vec<NavEntry>)>>,
+    recent_cache: Mutex<Option<(Instant, Vec<Recent>)>>,
 }
+
+/// Subtitle of the "open this folder" row shown first when a folder path is typed in full.
+pub const OPEN_DIR_SUBTITLE: &str = "打开此文件夹";
 
 pub fn now_secs() -> u64 {
     std::time::SystemTime::now()
@@ -140,6 +151,8 @@ impl Engine {
             locals: Vec::new(),
             learned: Vec::new(),
             learned_ids: HashSet::new(),
+            nav_cache: Mutex::new(None),
+            recent_cache: Mutex::new(None),
         };
         e.rebuild(&[]);
         e
@@ -165,7 +178,7 @@ impl Engine {
                     path: Some(path.to_string()),
                     score: 0.0,
                 },
-                hay: Haystack::new(name, ""),
+                hay: Haystack::new(name, &crate::py::keywords(name)),
                 trigger: None,
             });
             ids.insert(id.to_string());
@@ -300,7 +313,7 @@ impl Engine {
                         path: if a.uwp { None } else { Some(a.target.clone()) },
                         score: 0.0,
                     },
-                    hay: Haystack::new(&a.name, ""),
+                    hay: Haystack::new(&a.name, &crate::py::keywords(&a.name)),
                     trigger: None,
                 });
             }
@@ -328,7 +341,7 @@ impl Engine {
                     path: None,
                     score: 0.0,
                 },
-                hay: Haystack::new(&c.title, &kw),
+                hay: Haystack::new(&c.title, &format!("{kw} {}", crate::py::keywords(&c.title))),
                 trigger: Some(c.name.to_lowercase()),
             });
         }
@@ -410,11 +423,112 @@ impl Engine {
     }
 
     /// Full ranking. `files` are Everything hits; `files_fresh` says whether they belong to `query`.
+    /// Folder listing, cached for a couple of seconds. `None` = the folder did not answer in time.
+    fn nav_entries(&self, dir: &std::path::Path) -> Option<Vec<NavEntry>> {
+        if let Ok(g) = self.nav_cache.lock() {
+            if let Some((d, t, v)) = g.as_ref() {
+                if d == dir && t.elapsed() < Duration::from_secs(2) {
+                    return Some(v.clone());
+                }
+            }
+        }
+        let v = pathnav::list(dir)?;
+        if let Ok(mut g) = self.nav_cache.lock() {
+            *g = Some((dir.to_path_buf(), Instant::now(), v.clone()));
+        }
+        Some(v)
+    }
+
+    /// Recent files from Windows' own history, newest first (cached briefly).
+    fn recent_view(&self, q: &str) -> Option<Vec<Item>> {
+        let filter = recent::trigger(q)?;
+        let cached = self.recent_cache.lock().ok().and_then(|g| g.as_ref().filter(|(t, _)| t.elapsed() < Duration::from_secs(5)).map(|(_, v)| v.clone()));
+        let list = match cached {
+            Some(v) => v,
+            None => {
+                let v = recent::recent_dir().and_then(|d| recent::list(&d)).unwrap_or_default();
+                if let Ok(mut g) = self.recent_cache.lock() {
+                    *g = Some((Instant::now(), v.clone()));
+                }
+                v
+            }
+        };
+        let tokens: Vec<&str> = filter.split_whitespace().collect();
+        let mut out = Vec::new();
+        for (n, r) in list.iter().filter(|r| !self.cfg.is_excluded(&r.path)).enumerate() {
+            let lp = r.path.to_lowercase();
+            if !tokens.iter().all(|t| lp.contains(t)) {
+                continue;
+            }
+            out.push(Item {
+                id: lp,
+                title: basename(&r.path).to_string(),
+                subtitle: parent(&r.path).to_string(),
+                kind: if r.is_dir { Kind::Folder } else { Kind::File },
+                action: Action::Open { target: r.path.clone(), args: String::new(), admin: false, cwd: None },
+                path: Some(r.path.clone()),
+                score: NAV_SCORE_BASE - n as f32,
+            });
+            if out.len() >= 40 {
+                break;
+            }
+        }
+        Some(out)
+    }
+
+    /// Path browsing: `C:\Users\`, `~\Docs`, `%appdata%` list that folder.
+    fn path_view(&self, q: &str) -> Option<Vec<Item>> {
+        let nq = pathnav::parse(q, &|n| std::env::var(n).ok())?;
+        let dir_text = nq.dir.to_string_lossy().into_owned();
+        let mut out: Vec<Item> = Vec::new();
+        let Some(entries) = self.nav_entries(&nq.dir) else {
+            out.push(Item {
+                id: "nav:slow".into(),
+                title: "读取此目录超时".into(),
+                subtitle: dir_text,
+                kind: Kind::Folder,
+                action: Action::Copy(String::new()),
+                path: None,
+                score: NAV_SCORE_BASE,
+            });
+            return Some(out);
+        };
+        let mut n = 0f32;
+        let mut push = |out: &mut Vec<Item>, id_path: &str, title: String, subtitle: String, is_dir: bool| {
+            out.push(Item {
+                id: id_path.to_lowercase(),
+                title,
+                subtitle,
+                kind: if is_dir { Kind::Folder } else { Kind::File },
+                action: Action::Open { target: id_path.to_string(), args: String::new(), admin: false, cwd: None },
+                path: Some(id_path.to_string()),
+                score: NAV_SCORE_BASE - n,
+            });
+            n += 1.0;
+        };
+        if nq.trailing_sep && nq.dir.is_dir() {
+            let shown = dir_text.trim_end_matches(['\\', '/']);
+            let target = if shown.ends_with(':') { dir_text.as_str() } else { shown };
+            push(&mut out, target, dir_text.clone(), OPEN_DIR_SUBTITLE.to_string(), true);
+        }
+        for e in pathnav::select(&entries, &nq.filter) {
+            let full = format!("{dir_text}{}", e.name);
+            push(&mut out, &full, e.name.clone(), dir_text.clone(), e.is_dir);
+        }
+        Some(out)
+    }
+
     pub fn results(&self, query: &str, files: &[FileHit], files_fresh: bool) -> Vec<Item> {
         let now = now_secs();
         let q = query.trim();
         if q.is_empty() {
             return if self.cfg.show_recent_on_empty { self.frequent(now) } else { Vec::new() };
+        }
+        if let Some(items) = self.path_view(q) {
+            return items;
+        }
+        if let Some(items) = self.recent_view(q) {
+            return items;
         }
         if let Some(items) = self.clipboard_view(q) {
             return items;
@@ -617,7 +731,7 @@ impl Engine {
     /// Record a launch so the item ranks higher next time. `skipped` are ids that were listed
     /// above the chosen item for this query; they sink slightly for the same query.
     pub fn learn(&mut self, item: &Item, query: &str, skipped: &[String]) {
-        if matches!(item.kind, Kind::Calc | Kind::Clip)
+        if matches!(item.kind, Kind::Calc | Kind::Clip) || item.score >= NAV_SCORE_BASE
             || item.id.starts_with("web:") && item.score <= 0.0
         {
             return;
@@ -682,6 +796,43 @@ mod tests {
             },
         ]);
         e
+    }
+
+    #[test]
+    fn path_browsing_lists_filters_and_is_not_learned() {
+        let dir = std::env::temp_dir().join(format!("sf_engnav_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("Projects")).unwrap();
+        std::fs::write(dir.join("notes.txt"), b"x").unwrap();
+        std::env::set_var("SF_NAV_TEST_DIR", &dir);
+        let mut e = engine();
+        let all = e.results("%SF_NAV_TEST_DIR%/", &[], true);
+        let titles: Vec<_> = all.iter().map(|i| i.title.as_str()).collect();
+        assert_eq!(all[0].subtitle, OPEN_DIR_SUBTITLE, "{titles:?}");
+        assert_eq!(&titles[1..], ["Projects", "notes.txt"]);
+        assert_eq!(all[1].kind, Kind::Folder);
+        let some = e.results("%SF_NAV_TEST_DIR%/no", &[], true);
+        assert_eq!(some.len(), 1);
+        assert_eq!(some[0].title, "notes.txt");
+        // Browsing never pollutes the learned list.
+        let n = e.learner.len();
+        e.learn(&some[0], "%SF_NAV_TEST_DIR%/no", &[]);
+        assert_eq!(e.learner.len(), n);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chinese_app_names_found_by_pinyin() {
+        let mut e = engine();
+        e.rebuild(&[
+            AppEntry { name: "微信".into(), target: r"C:\sm\微信.lnk".into(), uwp: false },
+            AppEntry { name: "网易云音乐".into(), target: r"C:\sm\网易云音乐.lnk".into(), uwp: false },
+            AppEntry { name: "腾讯会议".into(), target: r"C:\sm\腾讯会议.lnk".into(), uwp: false },
+        ]);
+        for (q, want) in [("wx", "微信"), ("weixin", "微信"), ("wei", "微信"), ("wyyyy", "网易云音乐"), ("wangyiyunyinyue", "网易云音乐"), ("txhy", "腾讯会议"), ("微", "微信")] {
+            let r = e.results(q, &[], true);
+            assert!(r.iter().take(3).any(|i| i.title == want), "{q}: {:?}", r.iter().map(|i| &i.title).collect::<Vec<_>>());
+        }
     }
 
     #[test]

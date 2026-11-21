@@ -65,6 +65,9 @@ pub struct Config {
     pub show_recent_on_empty: bool,
     /// Where the user dragged the window to (top-left, screen pixels). `None` = centered.
     pub window_pos: Option<(i32, i32)>,
+    /// Which set of built-in commands this config has already received (see `migrate`).
+    #[serde(default = "zero")] // a file written before this field existed is version 0
+    pub defaults_version: u32,
     /// Path prefixes that never appear in results.
     pub excluded_dirs: Vec<String>,
     pub show_settings: bool,
@@ -123,6 +126,7 @@ impl Default for Config {
             hide_on_blur: true,
             show_recent_on_empty: false,
             window_pos: None,
+            defaults_version: DEFAULTS_VERSION,
             excluded_dirs: vec![
                 r"C:\$Recycle.Bin".into(),
                 r"C:\Windows\WinSxS".into(),
@@ -247,6 +251,30 @@ impl Default for Config {
                     &["explorer", "资源管理器"],
                 ),
                 cmd(
+                    "hibernate",
+                    "休眠",
+                    "shutdown.exe",
+                    "/h",
+                    false,
+                    &["休眠", "hibernate"],
+                ),
+                cmd(
+                    "shot",
+                    "截图 (区域)",
+                    "explorer.exe",
+                    "ms-screenclip:",
+                    false,
+                    &["screenshot", "截图", "snip"],
+                ),
+                cmd(
+                    "darkmode",
+                    "切换深色/浅色模式",
+                    "powershell.exe",
+                    r"-NoProfile -WindowStyle Hidden -Command $p='HKCU:\Software\Microsoft\Windows\CurrentVersion\Themes\Personalize'; $n=1-(Get-ItemProperty $p).AppsUseLightTheme; Set-ItemProperty $p AppsUseLightTheme $n; Set-ItemProperty $p SystemUsesLightTheme $n",
+                    false,
+                    &["dark", "light", "深色", "浅色", "主题", "theme"],
+                ),
+                cmd(
                     "emptybin",
                     "清空回收站",
                     "powershell.exe",
@@ -333,7 +361,37 @@ fn resolve_data_dir() -> PathBuf {
     base.join("SwiftFind")
 }
 
+fn zero() -> u32 {
+    0
+}
+
+/// Bump when new built-in commands are added; `migrate` hands them to existing configs once.
+const DEFAULTS_VERSION: u32 = 1;
+/// Commands introduced by each version (index 0 = version 1).
+const NEW_COMMANDS: &[&[&str]] = &[&["hibernate", "shot", "darkmode"]];
+
 impl Config {
+    /// Give an older config the built-in commands added since it was written — once, and only
+    /// those that are missing, so commands you deleted yourself stay deleted. Returns true when
+    /// something changed (the caller saves).
+    pub fn migrate(&mut self) -> bool {
+        if self.defaults_version >= DEFAULTS_VERSION {
+            return false;
+        }
+        let defaults = Config::default().commands;
+        for names in NEW_COMMANDS.iter().skip(self.defaults_version as usize) {
+            for name in *names {
+                if !self.commands.iter().any(|c| c.name.eq_ignore_ascii_case(name)) {
+                    if let Some(d) = defaults.iter().find(|c| c.name == *name) {
+                        self.commands.push(d.clone());
+                    }
+                }
+            }
+        }
+        self.defaults_version = DEFAULTS_VERSION;
+        true
+    }
+
     pub fn path() -> PathBuf {
         data_dir().join("config.json")
     }
@@ -344,11 +402,17 @@ impl Config {
 
     pub fn load_from(path: &std::path::Path) -> Self {
         match std::fs::read(path) {
-            Ok(b) => serde_json::from_slice(&b).unwrap_or_else(|e| {
-                crate::log::info(&format!("config.json is invalid ({e}); using defaults"));
-                quarantine(path);
-                Self::default()
-            }),
+            Ok(b) => {
+                let mut c: Config = serde_json::from_slice(&b).unwrap_or_else(|e| {
+                    crate::log::info(&format!("config.json is invalid ({e}); using defaults"));
+                    quarantine(path);
+                    Self::default()
+                });
+                if c.migrate() {
+                    c.save_to(path);
+                }
+                c
+            }
             Err(_) => {
                 let c = Self::default();
                 c.save_to(path);
@@ -430,6 +494,29 @@ mod tests {
         let c3 = Config::load_from(&p);
         assert_eq!(c3.hotkey, "Ctrl+Alt+K");
         assert!(!c3.commands.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migration_adds_new_default_commands_once_and_respects_deletions() {
+        let mut c = Config { defaults_version: 0, ..Config::default() };
+        c.commands.retain(|x| !["darkmode", "ping"].contains(&x.name.as_str()));
+        assert!(c.migrate());
+        assert!(c.commands.iter().any(|x| x.name == "darkmode"), "new command delivered");
+        assert!(!c.commands.iter().any(|x| x.name == "ping"), "user's deletion respected");
+        assert_eq!(c.defaults_version, DEFAULTS_VERSION);
+        let n = c.commands.len();
+        c.commands.retain(|x| x.name != "darkmode");
+        assert!(!c.migrate(), "runs only once");
+        assert_eq!(c.commands.len(), n - 1);
+        // A config file from an older version (no version field) triggers it on load.
+        let dir = std::env::temp_dir().join(format!("sf_mig_{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("config.json");
+        std::fs::write(&p, r#"{ "commands": [] }"#).unwrap();
+        let loaded = Config::load_from(&p);
+        assert_eq!(loaded.commands.len(), 3);
+        assert!(std::fs::read_to_string(&p).unwrap().contains("defaults_version"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
