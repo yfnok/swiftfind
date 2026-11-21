@@ -15,6 +15,10 @@ pub const WM_HOTKEY: u32 = 0x0312;
 pub const WM_USER: u32 = 0x0400;
 pub const WM_APP: u32 = 0x8000;
 pub const WM_QUIT: u32 = 0x0012;
+pub const WM_SETTEXT: u32 = 0x000C;
+pub const WM_GETTEXT: u32 = 0x000D;
+pub const WM_GETTEXTLENGTH: u32 = 0x000E;
+pub const BM_CLICK: u32 = 0x00F5;
 
 pub const MOD_ALT: u32 = 0x1;
 pub const MOD_CONTROL: u32 = 0x2;
@@ -211,6 +215,10 @@ extern "system" {
     pub fn UnregisterHotKey(h: HWND, id: i32) -> i32;
     pub fn ShowWindow(h: HWND, cmd: i32) -> i32;
     pub fn IsWindowVisible(h: HWND) -> i32;
+    pub fn IsWindow(h: HWND) -> i32;
+    pub fn GetClassNameW(h: HWND, buf: *mut u16, max: i32) -> i32;
+    pub fn GetDlgItem(h: HWND, id: i32) -> HWND;
+    pub fn FindWindowExW(parent: HWND, after: HWND, class: *const u16, title: *const u16) -> HWND;
     pub fn SetForegroundWindow(h: HWND) -> i32;
     pub fn GetForegroundWindow() -> HWND;
     pub fn BringWindowToTop(h: HWND) -> i32;

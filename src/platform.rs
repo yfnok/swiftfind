@@ -35,6 +35,9 @@ pub struct Shared {
     pub pending_query: Mutex<Option<String>>,
     /// Remembered window position (top-left) after the user dragged it; `None` = centered.
     pub saved_pos: Mutex<Option<(i32, i32)>>,
+    /// The standard file dialog (Open / Save As) that was in front when the launcher was shown,
+    /// or 0. Lets the launcher jump that dialog to a folder.
+    pub dialog_hwnd: AtomicIsize,
 }
 
 impl Shared {
@@ -52,6 +55,7 @@ impl Shared {
             suspended: AtomicBool::new(false),
             pending_query: Mutex::new(None),
             saved_pos: Mutex::new(None),
+            dialog_hwnd: AtomicIsize::new(0),
         })
     }
 }
@@ -365,11 +369,92 @@ mod imp {
         }
     }
 
+    fn find_child(parent: HWND, class: &str) -> HWND {
+        let c = wide(class);
+        unsafe { FindWindowExW(parent, 0, c.as_ptr(), std::ptr::null()) }
+    }
+
+    /// The file-name edit box of a classic/common file dialog (0 if `dlg` is not one).
+    fn dialog_name_edit(dlg: HWND) -> HWND {
+        unsafe {
+            let combo = GetDlgItem(dlg, 0x47C); // ComboBoxEx32 > ComboBox > Edit
+            if combo != 0 {
+                let inner = find_child(combo, "ComboBox");
+                let e = find_child(if inner != 0 { inner } else { combo }, "Edit");
+                return if e != 0 { e } else { combo };
+            }
+            GetDlgItem(dlg, 0x480) // old-style dialogs: a plain Edit
+        }
+    }
+
+    /// Is `h` a standard Open / Save As dialog we can drive?
+    pub fn is_file_dialog(h: HWND) -> bool {
+        unsafe {
+            if h == 0 || IsWindow(h) == 0 {
+                return false;
+            }
+            let mut buf = [0u16; 32];
+            let n = GetClassNameW(h, buf.as_mut_ptr(), 32);
+            n > 0 && String::from_utf16_lossy(&buf[..n as usize]) == "#32770" && dialog_name_edit(h) != 0 && GetDlgItem(h, 1) != 0
+        }
+    }
+
+    fn send_text(h: HWND, text: &str) -> bool {
+        let w = wide(text);
+        let mut r = 0usize;
+        unsafe { SendMessageTimeoutW(h, WM_SETTEXT, 0, w.as_ptr() as LPARAM, SMTO_ABORTIFHUNG, 800, &mut r) != 0 }
+    }
+
+    fn read_text(h: HWND) -> String {
+        unsafe {
+            let n = SendMessageW(h, WM_GETTEXTLENGTH, 0, 0).clamp(0, 4096) as usize;
+            let mut buf = vec![0u16; n + 1];
+            let got = SendMessageW(h, WM_GETTEXT, buf.len(), buf.as_mut_ptr() as LPARAM).max(0) as usize;
+            String::from_utf16_lossy(&buf[..got.min(n)])
+        }
+    }
+
+    /// Drive the remembered file dialog: go to `folder`; with `file`, also fill in its name.
+    /// Fails (instead of hanging) if the dialog is gone or belongs to an elevated program.
+    pub fn dialog_jump(shared: &Shared, folder: &str, file: Option<&str>) -> Result<(), String> {
+        let dlg = shared.dialog_hwnd.load(Ordering::Relaxed);
+        if !is_file_dialog(dlg) {
+            return Err("文件对话框已关闭".into());
+        }
+        let edit = dialog_name_edit(dlg);
+        let old = read_text(edit);
+        if !send_text(edit, folder) {
+            return Err("无法操作该对话框 (可能以管理员运行)".into());
+        }
+        let file = file.map(str::to_string);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(120));
+            force_foreground(dlg);
+            unsafe {
+                let ok = GetDlgItem(dlg, 1);
+                let mut r = 0usize;
+                SendMessageTimeoutW(ok, BM_CLICK, 0, 0, SMTO_ABORTIFHUNG, 800, &mut r);
+            }
+            // The dialog navigates asynchronously; then put back what the user had typed (or the
+            // chosen file's name).
+            std::thread::sleep(std::time::Duration::from_millis(350));
+            if unsafe { IsWindow(dlg) } != 0 {
+                send_text(edit, file.as_deref().unwrap_or(&old));
+            }
+        });
+        Ok(())
+    }
+
     /// Show the launcher centered (upper third) on the monitor that holds the mouse cursor.
     pub fn show_window(shared: &Shared) {
         let h = find_main_hwnd(shared);
         if h == 0 {
             return;
+        }
+        // Remember a file dialog that is in front right now (before we take the focus).
+        let fg = unsafe { GetForegroundWindow() };
+        if fg != h {
+            shared.dialog_hwnd.store(if is_file_dialog(fg) { fg } else { 0 }, Ordering::Relaxed);
         }
         unsafe {
             let mut cur = POINT::default();
@@ -697,6 +782,9 @@ mod imp {
         let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
         let (year, month, day, hour, minute, second) = crate::log::civil(secs);
         LocalTime { year, month, day, hour, minute, second }
+    }
+    pub fn dialog_jump(_shared: &Shared, _folder: &str, _file: Option<&str>) -> Result<(), String> {
+        Err("仅支持 Windows".into())
     }
     pub fn show_window(shared: &Shared) {
         shared.visible.store(true, Ordering::SeqCst);

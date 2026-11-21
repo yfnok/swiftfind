@@ -134,6 +134,23 @@ fn url_encode(s: &str) -> String {
     out
 }
 
+/// Unique folders from a recent list: the folder itself for directories, the parent for files.
+fn folders_from_recent(list: &[Recent], max: usize, excluded: &dyn Fn(&str) -> bool) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for r in list {
+        let d = if r.is_dir { r.path.trim_end_matches(['\\', '/']).to_string() } else { parent(&r.path).trim_end_matches(['\\', '/']).to_string() };
+        if d.is_empty() || excluded(&d) || !seen.insert(d.to_lowercase()) {
+            continue;
+        }
+        out.push(d);
+        if out.len() >= max {
+            break;
+        }
+    }
+    out
+}
+
 fn basename(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().unwrap_or(path)
 }
@@ -542,6 +559,25 @@ impl Engine {
         Some(v)
     }
 
+    /// Folders worth jumping to from a file dialog: recently used folders, then the folders of
+    /// recently used files (newest first, no duplicates).
+    pub fn dialog_folders(&self) -> Vec<Item> {
+        let list = recent::recent_dir().and_then(|d| recent::list(&d)).unwrap_or_default();
+        let dirs = folders_from_recent(&list, 12, &|p| self.cfg.is_excluded(p));
+        dirs.into_iter()
+            .enumerate()
+            .map(|(n, d)| Item {
+                id: d.to_lowercase(),
+                title: basename(&d).to_string(),
+                subtitle: parent(&d).to_string(),
+                kind: Kind::Folder,
+                action: Action::Open { target: d.clone(), args: String::new(), admin: false, cwd: None },
+                path: Some(d),
+                score: NAV_SCORE_BASE - n as f32,
+            })
+            .collect()
+    }
+
     /// Recent files from Windows' own history, newest first (cached briefly).
     fn recent_view(&self, q: &str) -> Option<Vec<Item>> {
         let filter = recent::trigger(q)?;
@@ -910,6 +946,21 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dialog_folders_dedupe_and_exclude() {
+        let r = |p: &str, d: bool| Recent { path: p.into(), is_dir: d };
+        let list = vec![
+            r(r"D:\Work\a.txt", false),
+            r(r"D:\Work\b.txt", false),
+            r(r"d:\work", true),
+            r(r"E:\Games\x.exe", false),
+            r(r"C:\Docs\", true),
+        ];
+        let out = folders_from_recent(&list, 10, &|p| p.starts_with(r"E:\Games"));
+        assert_eq!(out, vec![r"D:\Work".to_string(), r"C:\Docs".to_string()]);
+        assert_eq!(folders_from_recent(&list, 1, &|_| false).len(), 1);
+    }
 
     fn engine() -> Engine {
         let mut e = Engine::new(Config::default(), Learner::in_memory());

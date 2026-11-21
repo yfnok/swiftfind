@@ -112,6 +112,8 @@ pub struct App {
     user_moved: bool,
     scroll_to_selected: bool,
     dirty: bool,
+    /// The launcher was opened over a file dialog (see `platform::dialog_jump`).
+    dialog: bool,
 
     // Everything
     req_tx: Sender<SearchRequest>,
@@ -296,6 +298,7 @@ impl App {
             user_moved: false,
             scroll_to_selected: false,
             dirty: true,
+            dialog: false,
             req_tx,
             rep_rx,
             ev_path,
@@ -394,6 +397,7 @@ impl App {
             self.stop_recording();
         }
         self.confirm = None;
+        self.dialog = self.shared.dialog_hwnd.load(Ordering::Relaxed) != 0;
         self.thumbs.clear();
         self.query.clear();
         if let Some(q) = self
@@ -499,7 +503,11 @@ impl App {
             None
         };
         let fresh = self.files_query == self.query.trim();
-        self.results = self.engine.results(&self.query, &self.files, fresh);
+        self.results = if self.dialog && self.query.trim().is_empty() {
+            self.engine.dialog_folders()
+        } else {
+            self.engine.results(&self.query, &self.files, fresh)
+        };
         self.selected = keep_id
             .and_then(|id| self.results.iter().position(|i| i.id == id))
             .unwrap_or(0)
@@ -692,6 +700,31 @@ impl App {
                 return;
             }
             _ => {}
+        }
+        // Inside an Open/Save dialog, files and folders navigate the dialog instead of opening.
+        if self.dialog && mode == Mode::Normal && matches!(item.kind, Kind::File | Kind::Folder) {
+            if let Some(p) = &item.path {
+                let (folder, file) = if item.kind == Kind::Folder {
+                    (p.trim_end_matches(['\\', '/']).to_string(), None)
+                } else {
+                    match p.rsplit_once(['\\', '/']) {
+                        Some((d, f)) => (d.to_string(), Some(f.to_string())),
+                        None => (p.clone(), None),
+                    }
+                };
+                let folder = if folder.ends_with(':') { format!("{folder}\\") } else { folder };
+                match platform::dialog_jump(&self.shared, &folder, file.as_deref()) {
+                    Ok(()) => {
+                        self.engine.learn(&item, &query, &skipped);
+                        self.hide();
+                        return;
+                    }
+                    Err(e) => {
+                        self.dialog = false;
+                        self.toast(format!("{e}，改为直接打开"));
+                    }
+                }
+            }
         }
         match &item.action {
             Action::Open {
@@ -1410,7 +1443,12 @@ impl App {
             col,
         );
         let nav = crate::pathnav::is_path_query(&self.query);
-        let hint = match self.results.get(self.selected).map(|i| i.kind) {
+        let hint = if self.dialog {
+            "文件对话框模式 · Enter 跳转到该文件夹 (选文件则填入文件名)"
+        } else {
+            ""
+        };
+        let hint = if !hint.is_empty() { hint } else { match self.results.get(self.selected).map(|i| i.kind) {
             Some(Kind::File | Kind::Folder) if nav => "Tab/→ 补全 · Alt+← 上一级 · Enter 打开 · Shift+Enter 所在文件夹",
             Some(Kind::Snippet) => "Enter 粘贴到之前的窗口",
             Some(Kind::Clip) => "Enter 粘贴 · Shift+Enter 仅复制 · Ctrl+P 置顶 · Ctrl+Delete 删除",
@@ -1418,7 +1456,7 @@ impl App {
                 "Enter 打开 · Ctrl+Enter 管理员 · Shift+Enter 所在文件夹 · Ctrl+T 终端"
             }
             _ => "↑↓ 选择 · Enter 打开 · Ctrl+Enter 管理员 · Ctrl+, 设置",
-        };
+        } };
         painter.text(
             Pos2::new(rect.right() - 10.0, rect.center().y + 2.0),
             Align2::RIGHT_CENTER,
