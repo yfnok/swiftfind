@@ -157,6 +157,11 @@ pub struct App {
     thumbs: HashMap<i64, Option<egui::TextureHandle>>,
     ui_ignore_apps: String,
 
+    // real file/app icons (loaded on a background thread)
+    icons: crate::icons::IconLoader,
+    icon_tex: HashMap<String, Option<egui::TextureHandle>>,
+    icon_pending: std::collections::HashSet<String>,
+
     /// A dangerous command waiting for its second Enter.
     confirm: Option<(String, Instant)>,
 
@@ -317,6 +322,12 @@ impl App {
             clip_changed,
             thumbs: HashMap::new(),
             ui_ignore_apps: cfg.clipboard_ignore_apps.join(", "),
+            icons: {
+                let c = ctx.clone();
+                crate::icons::IconLoader::spawn_system(Box::new(move || c.request_repaint()))
+            },
+            icon_tex: HashMap::new(),
+            icon_pending: std::collections::HashSet::new(),
             confirm: None,
             toast: None,
         };
@@ -424,7 +435,18 @@ impl App {
             return;
         }
         self.req_id += 1;
-        let text = everything::search_text(&q, &self.engine.cfg.excluded_dirs);
+        // "f report": the scope letter is ours, Everything only sees "report" (and nothing at all
+        // for app/settings scopes).
+        let mut search_q = q.as_str();
+        if let Some((scope, rest)) = self.engine.split_scope(&q) {
+            if scope != crate::engine::Scope::Files || rest.is_empty() {
+                self.files.clear();
+                self.files_query.clear();
+                return;
+            }
+            search_q = rest;
+        }
+        let text = everything::search_text(search_q, &self.engine.cfg.excluded_dirs);
         let _ = self.req_tx.send(SearchRequest {
             id: self.req_id,
             text,
@@ -1026,6 +1048,31 @@ impl App {
         }
     }
 
+    /// Turn finished icon loads into textures.
+    fn poll_icons(&mut self, ctx: &egui::Context) {
+        if self.icon_tex.len() > 400 {
+            self.icon_tex.clear(); // plenty for any result list; cheap to refill
+        }
+        while let Ok((key, img)) = self.icons.rx.try_recv() {
+            self.icon_pending.remove(&key);
+            let tex = img.map(|i| {
+                let image = egui::ColorImage::from_rgba_unmultiplied([i.w, i.h], &i.rgba);
+                ctx.load_texture(format!("icon:{key}"), image, egui::TextureOptions::LINEAR)
+            });
+            self.icon_tex.insert(key, tex);
+        }
+    }
+
+    /// Ask for the icon of a visible row if it is not cached or already requested.
+    fn request_icon(&mut self, idx: usize) {
+        let Some(spec) = self.results.get(idx).and_then(crate::icons::spec_for) else { return };
+        if self.icon_tex.contains_key(&spec.key) || self.icon_pending.contains(&spec.key) {
+            return;
+        }
+        self.icon_pending.insert(spec.key.clone());
+        self.icons.request(spec);
+    }
+
     fn ensure_thumb(&mut self, ctx: &egui::Context, idx: usize) {
         let Some((id, true)) = self.results.get(idx).and_then(Engine::clip_id) else {
             return;
@@ -1076,15 +1123,25 @@ impl App {
             Vec2::splat(30.0),
         );
         let kc = kind_color(item.kind);
-        painter.rect_filled(badge, CornerRadius::same(8), kc.gamma_multiply(0.22));
-        let glyph = item.kind.label().chars().next().unwrap_or('?');
-        painter.text(
-            badge.center(),
-            Align2::CENTER_CENTER,
-            glyph,
-            FontId::proportional(15.0),
-            kc,
-        );
+        let icon = crate::icons::spec_for(item)
+            .and_then(|s| self.icon_tex.get(&s.key))
+            .and_then(|t| t.as_ref())
+            .map(|t| t.id());
+        if let Some(tex_id) = icon {
+            // The real icon, a little larger than the badge it replaces.
+            let r = Rect::from_center_size(badge.center(), Vec2::splat(32.0));
+            painter.image(tex_id, r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+        } else {
+            painter.rect_filled(badge, CornerRadius::same(8), kc.gamma_multiply(0.22));
+            let glyph = item.kind.label().chars().next().unwrap_or('?');
+            painter.text(
+                badge.center(),
+                Align2::CENTER_CENTER,
+                glyph,
+                FontId::proportional(15.0),
+                kc,
+            );
+        }
         // Image clips: show the thumbnail (fitted into a 38px box) over the badge.
         if let Some((tex_id, size)) = Engine::clip_id(item)
             .filter(|(_, img)| *img)
@@ -1179,6 +1236,7 @@ impl App {
                         Sense::hover(),
                     );
                     self.ensure_thumb(ctx, idx);
+                    self.request_icon(idx);
                     let resp = self.draw_row(ui, idx, rect);
                     if self.scroll_to_selected && idx == self.selected {
                         ui.scroll_to_rect(rect, None);
@@ -1653,6 +1711,7 @@ impl eframe::App for App {
             }
         }
         self.track_drag(ctx);
+        self.poll_icons(ctx);
         self.handle_keys(ctx);
         self.send_search_if_needed();
         if self.dirty {

@@ -12,6 +12,7 @@ mod config;
 mod engine;
 mod everything;
 mod icon;
+mod icons;
 mod learn;
 mod log;
 mod pathnav;

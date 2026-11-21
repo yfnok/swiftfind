@@ -259,8 +259,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         std::fs::write(dir.join("file.txt"), b"x").unwrap();
-        #[cfg(not(windows))]
-        std::fs::write(dir.join(".dot"), b"x").unwrap(); // dot-files count as hidden only off Windows
+        std::fs::write(dir.join(".dot"), b"x").unwrap();
         let got = select(&list(&dir).unwrap(), "");
         let names: Vec<_> = got.iter().map(|x| (x.name.as_str(), x.is_dir)).collect();
         assert_eq!(names, [("sub", true), ("file.txt", false)]);

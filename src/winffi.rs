@@ -51,6 +51,56 @@ pub struct RECT {
 }
 
 #[repr(C)]
+pub struct SHFILEINFOW {
+    pub hIcon: isize,
+    pub iIcon: i32,
+    pub dwAttributes: u32,
+    pub szDisplayName: [u16; 260],
+    pub szTypeName: [u16; 80],
+}
+
+#[repr(C)]
+pub struct ICONINFO {
+    pub fIcon: i32,
+    pub xHotspot: u32,
+    pub yHotspot: u32,
+    pub hbmMask: isize,
+    pub hbmColor: isize,
+}
+
+#[repr(C)]
+pub struct BITMAP {
+    pub bmType: i32,
+    pub bmWidth: i32,
+    pub bmHeight: i32,
+    pub bmWidthBytes: i32,
+    pub bmPlanes: u16,
+    pub bmBitsPixel: u16,
+    pub bmBits: *mut c_void,
+}
+
+#[repr(C)]
+pub struct BITMAPINFOHEADER {
+    pub biSize: u32,
+    pub biWidth: i32,
+    pub biHeight: i32,
+    pub biPlanes: u16,
+    pub biBitCount: u16,
+    pub biCompression: u32,
+    pub biSizeImage: u32,
+    pub biXPelsPerMeter: i32,
+    pub biYPelsPerMeter: i32,
+    pub biClrUsed: u32,
+    pub biClrImportant: u32,
+}
+
+#[repr(C)]
+pub struct BITMAPINFO {
+    pub bmiHeader: BITMAPINFOHEADER,
+    pub bmiColors: [u32; 1],
+}
+
+#[repr(C)]
 pub struct MSG {
     pub hwnd: HWND,
     pub message: u32,
@@ -106,6 +156,10 @@ pub struct MONITORINFO {
 
 #[link(name = "user32")]
 extern "system" {
+    pub fn GetIconInfo(icon: isize, info: *mut ICONINFO) -> i32;
+    pub fn DestroyIcon(icon: isize) -> i32;
+    pub fn GetDC(hwnd: HWND) -> isize;
+    pub fn ReleaseDC(hwnd: HWND, hdc: isize) -> i32;
     pub fn MessageBoxW(h: HWND, text: *const u16, caption: *const u16, flags: u32) -> i32;
     pub fn RegisterClassW(wc: *const WNDCLASSW) -> u16;
     pub fn CreateWindowExW(
@@ -171,6 +225,18 @@ pub const VK_V: u8 = 0x56;
 pub const GMEM_MOVEABLE: u32 = 0x0002;
 pub const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 
+#[link(name = "gdi32")]
+extern "system" {
+    pub fn GetObjectW(handle: isize, cb: i32, out: *mut c_void) -> i32;
+    pub fn GetDIBits(hdc: isize, bitmap: isize, start: u32, lines: u32, bits: *mut c_void, bmi: *mut BITMAPINFO, usage: u32) -> i32;
+    pub fn DeleteObject(obj: isize) -> i32;
+}
+
+#[link(name = "ole32")]
+extern "system" {
+    pub fn CoInitializeEx(reserved: *mut c_void, coinit: u32) -> i32;
+}
+
 #[link(name = "kernel32")]
 extern "system" {
     pub fn GetModuleHandleW(name: *const u16) -> isize;
@@ -198,6 +264,7 @@ pub const ERROR_ALREADY_EXISTS: u32 = 183;
 
 #[link(name = "shell32")]
 extern "system" {
+    pub fn SHGetFileInfoW(path: *const u16, attrs: u32, info: *mut SHFILEINFOW, cb: u32, flags: u32) -> usize;
     pub fn ShellExecuteW(
         h: HWND,
         verb: *const u16,

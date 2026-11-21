@@ -42,6 +42,32 @@ pub struct Engine {
     recent_cache: Mutex<Option<(Instant, Vec<Recent>)>>,
 }
 
+/// Search scope chosen by a one-letter prefix: `f report`, `a chrome`, `s firewall`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    Files,
+    Apps,
+    Settings,
+}
+
+impl Scope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Scope::Files => "仅文件",
+            Scope::Apps => "仅应用",
+            Scope::Settings => "仅设置",
+        }
+    }
+
+    fn allows(self, k: Kind) -> bool {
+        match self {
+            Scope::Files => matches!(k, Kind::File | Kind::Folder),
+            Scope::Apps => k == Kind::App,
+            Scope::Settings => k == Kind::Setting,
+        }
+    }
+}
+
 /// Subtitle of the "open this folder" row shown first when a folder path is typed in full.
 pub const OPEN_DIR_SUBTITLE: &str = "打开此文件夹";
 
@@ -518,7 +544,28 @@ impl Engine {
         Some(out)
     }
 
+    /// Split a leading scope letter (`f `, `a `, `s `) from the query. A command name or web
+    /// search key that equals the letter wins, so existing custom triggers keep working.
+    pub fn split_scope<'a>(&self, query: &'a str) -> Option<(Scope, &'a str)> {
+        let q = query.trim_start();
+        let (head, rest) = q.split_once(char::is_whitespace)?;
+        let scope = match head.to_lowercase().as_str() {
+            "f" => Scope::Files,
+            "a" => Scope::Apps,
+            "s" => Scope::Settings,
+            _ => return None,
+        };
+        let taken = self.cfg.commands.iter().any(|c| c.name.eq_ignore_ascii_case(head))
+            || self.cfg.web_searches.iter().any(|w| w.key.eq_ignore_ascii_case(head));
+        (!taken).then_some((scope, rest.trim()))
+    }
+
     pub fn results(&self, query: &str, files: &[FileHit], files_fresh: bool) -> Vec<Item> {
+        if let Some((scope, rest)) = self.split_scope(query) {
+            let mut r = self.results(rest, files, files_fresh);
+            r.retain(|i| scope.allows(i.kind));
+            return r;
+        }
         let now = now_secs();
         let q = query.trim();
         if q.is_empty() {
@@ -736,6 +783,8 @@ impl Engine {
         {
             return;
         }
+        // "f report" teaches the same thing as "report".
+        let query = self.split_scope(query).map_or(query, |(_, rest)| rest);
         let now = now_secs();
         let path = if matches!(item.kind, Kind::File | Kind::Folder) {
             item.path.as_deref()
@@ -819,6 +868,24 @@ mod tests {
         e.learn(&some[0], "%SF_NAV_TEST_DIR%/no", &[]);
         assert_eq!(e.learner.len(), n);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scope_prefix_limits_kinds_and_yields_to_custom_triggers() {
+        let mut e = engine();
+        e.rebuild(&[AppEntry { name: "Firefox".into(), target: r"C:\sm\Firefox.lnk".into(), uwp: false }]);
+        let hits = vec![FileHit { path: r"D:\docs\firewall notes.txt".into(), is_folder: false }];
+        let kinds = |q: &str| e.results(q, &hits, true).iter().map(|i| i.kind.label()).collect::<std::collections::BTreeSet<_>>();
+        assert!(kinds("fire").len() > 1, "unscoped mixes kinds");
+        assert_eq!(kinds("f fire"), [Kind::File.label()].into_iter().collect());
+        assert_eq!(kinds("a fire"), [Kind::App.label()].into_iter().collect());
+        assert_eq!(kinds("s fire"), [Kind::Setting.label()].into_iter().collect());
+        assert!(e.results("f ", &hits, true).is_empty());
+        assert_eq!(e.split_scope("F  report").map(|(s, r)| (s, r.to_string())), Some((Scope::Files, "report".to_string())));
+        assert!(e.split_scope("fire").is_none() && e.split_scope("x fire").is_none());
+        // A user-defined command called "a" keeps its meaning.
+        e.cfg.commands.push(crate::config::CustomCommand { name: "a".into(), ..e.cfg.commands[0].clone() });
+        assert!(e.split_scope("a chrome").is_none());
     }
 
     #[test]
