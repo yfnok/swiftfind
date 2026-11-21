@@ -206,9 +206,9 @@ mod tests {
         std::fs::write(&real_a, b"x").unwrap();
         std::fs::write(&real_b, b"x").unwrap();
         let mk = |name: &str, target: &Path| {
-            let s = target.to_string_lossy();
-            let (base, suffix) = s.rsplit_once('/').unwrap();
-            std::fs::write(dir.join(name), make_lnk(&format!("{base}/"), suffix, true, true)).unwrap();
+            let base = format!("{}{}", target.parent().unwrap().display(), std::path::MAIN_SEPARATOR);
+            let suffix = target.file_name().unwrap().to_string_lossy().into_owned();
+            std::fs::write(dir.join(name), make_lnk(&base, &suffix, true, true)).unwrap();
         };
         mk("a.lnk", &real_a);
         std::thread::sleep(Duration::from_millis(30));
@@ -216,7 +216,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(30));
         mk("b.lnk", &real_b);
         let got = list(&dir).unwrap();
-        let names: Vec<_> = got.iter().map(|r| r.path.rsplit('/').next().unwrap().to_string()).collect();
+        let names: Vec<_> = got.iter().map(|r| Path::new(&r.path).file_name().unwrap().to_string_lossy().into_owned()).collect();
         assert_eq!(names, ["b.txt", "a.txt"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
