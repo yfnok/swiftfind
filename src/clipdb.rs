@@ -453,6 +453,17 @@ impl Store {
         self.remove_ids(&[id as u64], false);
     }
 
+    /// Unpinned items matching `query` (same syntax as `search`), newest first.
+    pub fn matching_unpinned(&self, query: &str) -> Vec<i64> {
+        self.search(query, usize::MAX).into_iter().filter(|r| !r.pinned).map(|r| r.id).collect()
+    }
+
+    /// Delete every unpinned item matching `query`; returns how many were removed.
+    pub fn delete_matching(&self, query: &str) -> usize {
+        let ids: Vec<u64> = self.matching_unpinned(query).into_iter().map(|i| i as u64).collect();
+        self.remove_ids(&ids, true)
+    }
+
     /// Flip the pin flag; returns the new state.
     pub fn toggle_pin(&self, id: i64) -> Option<bool> {
         let run = || -> DbResult<Option<bool>> {
@@ -553,6 +564,19 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_delete_by_keyword_keeps_pinned() {
+        let s = Store::open_memory().unwrap();
+        let a = s.add_text("magnet:?xt=urn:btih:1", "", 1).unwrap().unwrap();
+        s.add_text("magnet:?xt=urn:btih:2", "", 2).unwrap();
+        s.add_text("hello world", "", 3).unwrap();
+        s.toggle_pin(a);
+        assert_eq!(s.matching_unpinned("magnet").len(), 1);
+        assert_eq!(s.delete_matching("magnet"), 1);
+        assert_eq!(s.search("magnet", 10).len(), 1); // the pinned one survives
+        assert_eq!(s.search("hello", 10).len(), 1);
+    }
 
     fn st() -> Store {
         Store::open_memory().unwrap()

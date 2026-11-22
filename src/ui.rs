@@ -873,6 +873,7 @@ impl App {
         let mut toggle_panel = false;
         let mut exclude_sel = false;
         let mut forget_sel = false;
+        let mut bulk_del = false;
         let mut copy_sel = false;
         let mut pin_sel = false;
         let mut moved: Option<i32> = None;
@@ -952,7 +953,9 @@ impl App {
             if i.consume_key(Modifiers::CTRL, Key::D) {
                 exclude_sel = true;
             }
-            if i.consume_key(Modifiers::CTRL, Key::Delete) {
+            if i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::Delete) {
+                bulk_del = true;
+            } else if i.consume_key(Modifiers::CTRL, Key::Delete) {
                 forget_sel = true;
             }
             if i.consume_key(Modifiers::NONE, Key::Escape) {
@@ -1002,9 +1005,17 @@ impl App {
         if forget_sel {
             if let Some(it) = self.results.get(self.selected).cloned() {
                 self.engine.forget(&it);
-                self.toast("已清除该项的学习记录");
+                if it.kind == Kind::Clip {
+                    self.thumbs.clear();
+                    self.toast("已删除该剪贴板记录");
+                } else {
+                    self.toast("已清除该项的学习记录");
+                }
                 self.dirty = true;
             }
+        }
+        if bulk_del {
+            self.bulk_delete_clips();
         }
         if hide {
             self.confirm = None;
@@ -1014,6 +1025,36 @@ impl App {
                 self.hide();
             }
         }
+    }
+
+    /// Ctrl+Shift+Delete in a clipboard query: delete every (unpinned) record matching the
+    /// filter, after a second press to confirm.
+    fn bulk_delete_clips(&mut self) {
+        let Some(filter) = crate::engine::Engine::clip_filter(&self.query).map(str::to_string) else {
+            self.toast("批量删除：先输入 cb 关键词，例如 cb magnet");
+            return;
+        };
+        if filter.is_empty() {
+            self.toast("批量删除需要关键词，例如 cb magnet (清空全部请到设置)");
+            return;
+        }
+        let id = format!("clipbulk:{filter}");
+        let n = self.engine.clip.matching_unpinned(&filter).len();
+        if n == 0 {
+            self.toast("没有可删除的匹配记录 (置顶项不会被删除)");
+            return;
+        }
+        let confirmed = matches!(&self.confirm, Some((c, t)) if *c == id && t.elapsed() < Duration::from_secs(5));
+        if !confirmed {
+            self.confirm = Some((id, Instant::now()));
+            self.toast(format!("将删除 {n} 条含「{filter}」的记录 — 再按一次 Ctrl+Shift+Delete 确认 (置顶项保留)"));
+            return;
+        }
+        self.confirm = None;
+        let done = self.engine.clip.delete_matching(&filter);
+        self.thumbs.clear();
+        self.dirty = true;
+        self.toast(format!("已删除 {done} 条记录"));
     }
 
     /// Replace the search text and put the caret at its end.
@@ -1451,7 +1492,7 @@ impl App {
         let hint = if !hint.is_empty() { hint } else { match self.results.get(self.selected).map(|i| i.kind) {
             Some(Kind::File | Kind::Folder) if nav => "Tab/→ 补全 · Alt+← 上一级 · Enter 打开 · Shift+Enter 所在文件夹",
             Some(Kind::Snippet) => "Enter 粘贴到之前的窗口",
-            Some(Kind::Clip) => "Enter 粘贴 · Shift+Enter 仅复制 · Ctrl+P 置顶 · Ctrl+Delete 删除",
+            Some(Kind::Clip) => "Enter 粘贴 · Shift+Enter 仅复制 · Ctrl+P 置顶 · Ctrl+Del 删除 · Ctrl+Shift+Del 删除全部匹配",
             Some(Kind::File | Kind::Folder) => {
                 "Enter 打开 · Ctrl+Enter 管理员 · Shift+Enter 所在文件夹 · Ctrl+T 终端"
             }

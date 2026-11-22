@@ -930,6 +930,12 @@ impl Engine {
         self.rebuild_learned();
     }
 
+    /// The filter part of a clipboard query (`cb magnet` → `magnet`), if `q` is one.
+    pub fn clip_filter(q: &str) -> Option<&str> {
+        let (first, rest) = q.trim().split_once(char::is_whitespace).unwrap_or((q.trim(), ""));
+        (first.eq_ignore_ascii_case("cb") || first.eq_ignore_ascii_case("clip")).then_some(rest.trim())
+    }
+
     pub fn exclude(&mut self, path: &str) {
         if !self
             .cfg
