@@ -204,7 +204,7 @@ pub enum RecPoll {
 pub fn poll_recording(force_win: bool) -> RecPoll {
     #[cfg(windows)]
     unsafe {
-        let down = |vk: i32| (GetAsyncKeyState(vk) as u16) & 0x8000 != 0;
+        let down = |vk: i32| (crate::winffi::GetAsyncKeyState(vk) as u16) & 0x8000 != 0;
         let (ctrl, alt, shift) = (down(0x11), down(0x12), down(0x10));
         let win = force_win || down(0x5B) || down(0x5C);
         let main = (0x08u32..=0xDE).find(|&vk| vk_name(vk).is_some() && down(vk as i32));
