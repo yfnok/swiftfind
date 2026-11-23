@@ -874,6 +874,10 @@ impl App {
         let mut exclude_sel = false;
         let mut forget_sel = false;
         let mut bulk_del = false;
+        let mut copy_file = false;
+        let text_selected = egui::text_edit::TextEditState::load(ctx, egui::Id::new("query"))
+            .and_then(|s| s.cursor.char_range())
+            .is_some_and(|r| r.primary != r.secondary);
         let mut copy_sel = false;
         let mut pin_sel = false;
         let mut moved: Option<i32> = None;
@@ -944,6 +948,10 @@ impl App {
             if i.consume_key(Modifiers::CTRL | Modifiers::SHIFT, Key::C) {
                 copy_sel = true;
             }
+            // Plain Ctrl+C arrives as an `Event::Copy`; with no text selected it copies the file.
+            if !text_selected && i.events.iter().any(|e| matches!(e, egui::Event::Copy)) {
+                copy_file = true;
+            }
             if i.consume_key(Modifiers::CTRL, Key::P) {
                 pin_sel = true;
             }
@@ -996,6 +1004,9 @@ impl App {
         if copy_sel {
             self.activate(ctx, self.selected, Mode::CopyPath);
         }
+        if copy_file {
+            self.copy_selected_file();
+        }
         if exclude_sel {
             self.exclude_selected();
         }
@@ -1024,6 +1035,25 @@ impl App {
             } else {
                 self.hide();
             }
+        }
+    }
+
+    /// Ctrl+C on a file or folder result: put the file itself on the clipboard (paste it in Explorer).
+    fn copy_selected_file(&mut self) {
+        let Some(it) = self.results.get(self.selected) else {
+            return;
+        };
+        if !matches!(it.kind, Kind::File | Kind::Folder) {
+            return;
+        }
+        let Some(p) = it.path.clone() else {
+            return;
+        };
+        let name = p.rsplit(['\\', '/']).next().unwrap_or(&p).to_string();
+        if platform::set_clip_files(&[p]) {
+            self.toast(format!("已复制文件「{name}」，可在资源管理器中粘贴"));
+        } else {
+            self.toast("复制文件失败");
         }
     }
 
@@ -1494,7 +1524,7 @@ impl App {
             Some(Kind::Snippet) => "Enter 粘贴到之前的窗口",
             Some(Kind::Clip) => "Enter 粘贴 · Shift+Enter 仅复制 · Ctrl+P 置顶 · Ctrl+Del 删除 · Alt+Del 删除全部匹配",
             Some(Kind::File | Kind::Folder) => {
-                "Enter 打开 · Ctrl+Enter 管理员 · Shift+Enter 所在文件夹 · Ctrl+T 终端"
+                "Enter 打开 · Ctrl+C 复制文件 · Shift+Enter 所在文件夹 · Ctrl+T 终端"
             }
             _ => "↑↓ 选择 · Enter 打开 · Ctrl+Enter 管理员 · Ctrl+, 设置",
         } };
@@ -1569,6 +1599,13 @@ impl App {
                 changed |= ui.checkbox(&mut self.engine.cfg.show_bookmarks, "搜索浏览器书签").changed();
                 changed |= ui.checkbox(&mut self.engine.cfg.show_settings, "搜索 Windows 设置").changed();
             });
+            if ui
+                .checkbox(&mut self.engine.cfg.game_mode, "游戏模式：全屏程序运行时暂停全局热键")
+                .changed()
+            {
+                self.shared.game_mode.store(self.engine.cfg.game_mode, Ordering::Relaxed);
+                self.engine.cfg.save();
+            }
             if changed {
                 let dark = self.engine.cfg.dark_mode;
                 self.palette = if dark { Palette::dark() } else { Palette::light() };

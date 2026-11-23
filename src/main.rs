@@ -39,6 +39,7 @@ fn main() -> eframe::Result {
 
     let cfg = config::Config::load();
     let shared = platform::Shared::new(&cfg.hotkey, &cfg.clipboard_hotkey, !background);
+    shared.game_mode.store(cfg.game_mode, std::sync::atomic::Ordering::Relaxed);
     if let Ok(mut g) = shared.saved_pos.lock() {
         *g = cfg.window_pos;
     }

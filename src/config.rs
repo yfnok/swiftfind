@@ -96,6 +96,8 @@ pub struct Config {
     pub show_files: bool,
     /// Search Chrome/Edge/Brave/Vivaldi bookmarks.
     pub show_bookmarks: bool,
+    /// Release the global hotkeys while a full-screen program (a game, a video) is in front.
+    pub game_mode: bool,
     pub dark_mode: bool,
     pub commands: Vec<CustomCommand>,
     /// Text snippets: `name` pastes `text` (with `{date}`-style variables) into the previous window.
@@ -160,6 +162,7 @@ impl Default for Config {
             show_settings: true,
             show_apps: true,
             show_bookmarks: true,
+            game_mode: true,
             snippets: default_snippets(),
             show_files: true,
             dark_mode: true,

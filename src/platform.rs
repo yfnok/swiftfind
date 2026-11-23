@@ -38,6 +38,10 @@ pub struct Shared {
     /// The standard file dialog (Open / Save As) that was in front when the launcher was shown,
     /// or 0. Lets the launcher jump that dialog to a folder.
     pub dialog_hwnd: AtomicIsize,
+    /// Game mode is enabled in the settings.
+    pub game_mode: AtomicBool,
+    /// A full-screen program is in front, so the global hotkeys are currently released.
+    pub game_paused: AtomicBool,
 }
 
 impl Shared {
@@ -56,11 +60,38 @@ impl Shared {
             pending_query: Mutex::new(None),
             saved_pos: Mutex::new(None),
             dialog_hwnd: AtomicIsize::new(0),
+            game_mode: AtomicBool::new(true),
+            game_paused: AtomicBool::new(false),
         })
     }
 }
 
 // ───────────────────────── pure helpers (tested everywhere) ─────────────────────────
+
+/// Bytes of a CF_HDROP clipboard payload (a `DROPFILES` header + double-NUL-terminated wide list).
+pub fn build_dropfiles(paths: &[String]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(20 + paths.iter().map(|p| p.len() * 2 + 2).sum::<usize>() + 2);
+    out.extend_from_slice(&20u32.to_le_bytes()); // pFiles: offset of the list
+    out.extend_from_slice(&[0u8; 8]); // pt.x, pt.y
+    out.extend_from_slice(&0u32.to_le_bytes()); // fNC
+    out.extend_from_slice(&1u32.to_le_bytes()); // fWide
+    for p in paths {
+        for u in p.encode_utf16() {
+            out.extend_from_slice(&u.to_le_bytes());
+        }
+        out.extend_from_slice(&[0, 0]);
+    }
+    out.extend_from_slice(&[0, 0]);
+    out
+}
+
+/// Does a window with this rectangle and style look like a full-screen program on a monitor?
+/// Borderless (no caption) and covering the whole monitor — a maximized normal window keeps its
+/// title bar, so it never counts.
+pub fn is_fullscreen(win: (i32, i32, i32, i32), mon: (i32, i32, i32, i32), style: u32) -> bool {
+    const WS_CAPTION: u32 = 0x00C0_0000;
+    style & WS_CAPTION != WS_CAPTION && win.0 <= mon.0 && win.1 <= mon.1 && win.2 >= mon.2 && win.3 >= mon.3 && mon.2 > mon.0
+}
 
 pub const MOD_ALT: u32 = 0x1;
 pub const MOD_CONTROL: u32 = 0x2;
@@ -273,6 +304,28 @@ mod imp {
                     }
                 }
             }
+            put_clipboard(items)
+        }
+    }
+
+    /// Copy files themselves (CF_HDROP) so they can be pasted in Explorer.
+    pub fn set_clip_files(paths: &[String]) -> bool {
+        if paths.is_empty() {
+            return false;
+        }
+        unsafe {
+            let mut items = vec![(15u32, alloc_global(&build_dropfiles(paths)))];
+            let fmt = RegisterClipboardFormatW(wide("Preferred DropEffect").as_ptr());
+            if fmt != 0 {
+                items.push((fmt, alloc_global(&1u32.to_le_bytes()))); // DROPEFFECT_COPY
+            }
+            put_clipboard(items)
+        }
+    }
+
+    /// Replace the clipboard contents with `items` (format, global memory). Takes ownership of the
+    /// memory: freed here unless the clipboard accepted it.
+    unsafe fn put_clipboard(items: Vec<(u32, isize)>) -> bool {
             let free_all = |items: &[(u32, isize)]| {
                 for (_, h) in items {
                     if *h != 0 {
@@ -308,7 +361,6 @@ mod imp {
             }
             CloseClipboard();
             ok
-        }
     }
 
     /// Put `c` on the clipboard and send Ctrl+V to whichever window gets focus once the
@@ -572,6 +624,32 @@ mod imp {
         Ok(())
     }
 
+    /// Is a full-screen program (not the desktop, not us) the foreground window?
+    fn fullscreen_in_front(shared: &Shared) -> bool {
+        unsafe {
+            let fg = GetForegroundWindow();
+            if fg == 0 || fg == shared.hwnd.load(Ordering::Relaxed) || IsWindowVisible(fg) == 0 {
+                return false;
+            }
+            let mut buf = [0u16; 64];
+            let n = GetClassNameW(fg, buf.as_mut_ptr(), 64).max(0) as usize;
+            let class = String::from_utf16_lossy(&buf[..n]);
+            if matches!(class.as_str(), "Progman" | "WorkerW" | "Shell_TrayWnd" | "Shell_SecondaryTrayWnd") {
+                return false;
+            }
+            let mut rc = RECT::default();
+            if GetWindowRect(fg, &mut rc) == 0 {
+                return false;
+            }
+            let mut mi = MONITORINFO { cbSize: std::mem::size_of::<MONITORINFO>() as u32, ..std::mem::zeroed() };
+            if GetMonitorInfoW(MonitorFromWindow(fg, MONITOR_DEFAULTTONEAREST), &mut mi) == 0 {
+                return false;
+            }
+            let m = mi.rcMonitor;
+            is_fullscreen((rc.left, rc.top, rc.right, rc.bottom), (m.left, m.top, m.right, m.bottom), GetWindowLongW(fg, GWL_STYLE) as u32)
+        }
+    }
+
     fn apply_hotkey(shared: &Shared) {
         let hk = shared.hotkey.lock().map(|h| h.clone()).unwrap_or_default();
         let ck = shared
@@ -579,7 +657,7 @@ mod imp {
             .lock()
             .map(|h| h.clone())
             .unwrap_or_default();
-        let (r1, r2) = if shared.suspended.load(Ordering::SeqCst) {
+        let (r1, r2) = if shared.suspended.load(Ordering::SeqCst) || shared.game_paused.load(Ordering::SeqCst) {
             unsafe {
                 UnregisterHotKey(0, 1);
                 UnregisterHotKey(0, 2);
@@ -683,9 +761,19 @@ mod imp {
                             .ok()
                     });
 
+                // Game mode: every 1.5 s look at the foreground window.
+                SetTimer(0, 1, 1500, std::ptr::null());
                 let mut msg = MSG::default();
                 while GetMessageW(&mut msg, 0, 0, 0) > 0 {
                     match msg.message {
+                        WM_TIMER if msg.hwnd == 0 => {
+                            crate::log::guarded("game mode", || {
+                                let want = shared.game_mode.load(Ordering::Relaxed) && fullscreen_in_front(&shared);
+                                if shared.game_paused.swap(want, Ordering::SeqCst) != want {
+                                    apply_hotkey(&shared);
+                                }
+                            });
+                        }
                         WM_HOTKEY => {
                             crate::log::guarded("hotkey handler", || {
                                 if msg.wparam == 2 {
@@ -771,6 +859,9 @@ mod imp {
         Err(format!("仅支持 Windows (无法打开 {target})"))
     }
     pub fn reveal_in_explorer(_path: &str) {}
+    pub fn set_clip_files(_paths: &[String]) -> bool {
+        false
+    }
     pub fn set_clip(_c: &ClipContent) -> bool {
         false
     }
@@ -827,6 +918,26 @@ pub use imp::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropfiles_layout() {
+        let b = build_dropfiles(&[r"C:\a.txt".to_string(), r"D:\é".to_string()]);
+        assert_eq!(&b[0..4], &20u32.to_le_bytes());
+        assert_eq!(&b[16..20], &1u32.to_le_bytes()); // fWide
+        let units: Vec<u16> = b[20..].chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let text = String::from_utf16(&units).unwrap();
+        assert_eq!(text, "C:\\a.txt\0D:\\é\0\0");
+        assert_eq!(b.len() % 2, 0);
+    }
+
+    #[test]
+    fn fullscreen_detection() {
+        let mon = (0, 0, 1920, 1080);
+        assert!(is_fullscreen((0, 0, 1920, 1080), mon, 0x9000_0000)); // borderless game
+        assert!(!is_fullscreen((-8, -8, 1928, 1040), mon, 0x17CF_0000)); // maximized, has caption
+        assert!(!is_fullscreen((100, 100, 900, 700), mon, 0)); // small window
+        assert!(is_fullscreen((-1, -1, 1921, 1081), mon, 0)); // slightly oversize borderless
+    }
 
     #[test]
     fn hotkeys_parse() {
