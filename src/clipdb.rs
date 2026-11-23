@@ -284,7 +284,8 @@ impl Store {
     /// Search. Whitespace-separated tokens are ANDed; each must occur in the text or in the
     /// source program name (case-insensitive). Special tokens: `img`/`图片` (images only),
     /// `text`/`文本`, `pin`/`置顶`. Newest first, pinned on top.
-    pub fn search(&self, query: &str, limit: usize) -> Vec<ClipRow> {
+    /// All items matching `query`, pinned first then newest first (ids + metadata only).
+    fn matching(&self, query: &str) -> Vec<(u64, Meta)> {
         let mut only_kind: Option<ClipKind> = None;
         let mut only_pinned = false;
         let mut tokens: Vec<String> = Vec::new();
@@ -342,6 +343,17 @@ impl Store {
                 .then(b.1.ts.cmp(&a.1.ts))
                 .then(b.0.cmp(&a.0))
         });
+        hits
+    }
+
+    pub fn search(&self, query: &str, limit: usize) -> Vec<ClipRow> {
+        let mut hits = self.matching(query);
+        let Ok(rtx) = self.db.begin_read() else {
+            return Vec::new();
+        };
+        let Ok(texts) = rtx.open_table(TEXTS) else {
+            return Vec::new();
+        };
         hits.truncate(limit.min(500));
 
         hits.into_iter()
@@ -455,7 +467,7 @@ impl Store {
 
     /// Unpinned items matching `query` (same syntax as `search`), newest first.
     pub fn matching_unpinned(&self, query: &str) -> Vec<i64> {
-        self.search(query, usize::MAX).into_iter().filter(|r| !r.pinned).map(|r| r.id).collect()
+        self.matching(query).into_iter().filter(|(_, m)| !m.pinned).map(|(id, _)| id as i64).collect()
     }
 
     /// Delete every unpinned item matching `query`; returns how many were removed.
@@ -564,6 +576,16 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bulk_delete_is_not_capped_at_search_limit() {
+        let s = Store::open_memory().unwrap();
+        for n in 0..700u64 {
+            s.add_text(&format!("magnet {n}"), "", n + 1).unwrap();
+        }
+        assert_eq!(s.delete_matching("magnet"), 700);
+        assert!(s.search("magnet", 10).is_empty());
+    }
 
     #[test]
     fn bulk_delete_by_keyword_keeps_pinned() {

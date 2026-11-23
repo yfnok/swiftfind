@@ -12,7 +12,7 @@ cargo build --release
 
 产物：`target\release\swiftfind.exe`（单文件，无需 DLL）。也可以把项目推到 GitHub，用 `.github/workflows/build.yml` 自动构建。
 
-首次运行建议先 `cargo test`，纯逻辑部分（排序、学习、匹配、剪贴板、IPC 解析、热键解析）有 108 个单元测试。
+首次运行建议先 `cargo test`，纯逻辑部分（排序、学习、匹配、剪贴板、IPC 解析、热键解析）有 109 个单元测试。
 
 ## 使用
 
@@ -181,5 +181,5 @@ src/ui.rs         界面
 ## 剪贴板删除
 
 - `cb` 列表中选中一条，`Ctrl+Delete` 删除该条。
-- `cb magnet` 这类带关键词的查询，`Ctrl+Shift+Delete` 删除全部匹配项（先提示数量，再按一次确认；置顶项不会被删）。
+- `cb magnet` 这类带关键词的查询，`Alt+Delete` 删除全部匹配项（先提示数量，再按一次确认；置顶项不会被删）。
 - 设置里的“清空历史”清空全部非置顶记录。
