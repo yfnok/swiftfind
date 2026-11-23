@@ -13,7 +13,8 @@
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 pub const MAX_TEXT_CHARS: usize = 200_000;
 pub const MAX_IMAGE_BYTES: usize = 30 * 1024 * 1024;
@@ -123,7 +124,9 @@ impl Meta {
 /// Shared handle to the clipboard database.
 #[derive(Clone)]
 pub struct Store {
-    db: Arc<Database>,
+    /// The lock is only ever taken for writing by `compact`, which needs `&mut Database`.
+    db: Arc<RwLock<Database>>,
+    compacting: Arc<AtomicBool>,
 }
 
 impl Store {
@@ -159,7 +162,32 @@ impl Store {
             tx.open_table(SEQ)?;
         }
         tx.commit()?;
-        Ok(Self { db: Arc::new(db) })
+        Ok(Self { db: Arc::new(RwLock::new(db)), compacting: Arc::new(AtomicBool::new(false)) })
+    }
+
+    fn db(&self) -> std::sync::RwLockReadGuard<'_, Database> {
+        self.db.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Hand freed pages back to the OS (shrinks the file). Does nothing if a transaction is still
+    /// open elsewhere — the next clean-up simply tries again.
+    pub fn compact(&self) {
+        if self.compacting.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(mut g) = self.db.write() {
+            let _ = g.compact(redb::CompactionMode::Balanced);
+        }
+        self.compacting.store(false, Ordering::SeqCst);
+    }
+
+    /// `compact` on a background thread, so deleting never stalls the UI.
+    fn compact_later(&self) {
+        let me = self.clone();
+        let _ = std::thread::Builder::new().name("clip-compact".into()).spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            me.compact();
+        });
     }
 
     fn next_id(tx: &redb::WriteTransaction) -> DbResult<u64> {
@@ -201,7 +229,7 @@ impl Store {
             return Ok(None);
         }
         let hash = content_hash(text.as_bytes());
-        let tx = self.db.begin_write()?;
+        let tx = self.db().begin_write()?;
         let id = match Self::bump_existing(&tx, false, hash, src, now_ms)? {
             Some(id) => id,
             None => {
@@ -239,7 +267,7 @@ impl Store {
             return Ok(None);
         }
         let hash = content_hash(png);
-        let tx = self.db.begin_write()?;
+        let tx = self.db().begin_write()?;
         let id = match Self::bump_existing(&tx, true, hash, src, now_ms)? {
             Some(id) => id,
             None => {
@@ -267,7 +295,7 @@ impl Store {
 
     /// Every metadata row (unsorted).
     fn all_meta(&self) -> Vec<(u64, Meta)> {
-        let Ok(rtx) = self.db.begin_read() else {
+        let Ok(rtx) = self.db().begin_read() else {
             return Vec::new();
         };
         let Ok(meta) = rtx.open_table(META) else {
@@ -297,7 +325,7 @@ impl Store {
                 t => tokens.push(t.to_string()),
             }
         }
-        let Ok(rtx) = self.db.begin_read() else {
+        let Ok(rtx) = self.db().begin_read() else {
             return Vec::new();
         };
         let (Ok(meta), Ok(texts)) = (rtx.open_table(META), rtx.open_table(TEXTS)) else {
@@ -348,7 +376,7 @@ impl Store {
 
     pub fn search(&self, query: &str, limit: usize) -> Vec<ClipRow> {
         let mut hits = self.matching(query);
-        let Ok(rtx) = self.db.begin_read() else {
+        let Ok(rtx) = self.db().begin_read() else {
             return Vec::new();
         };
         let Ok(texts) = rtx.open_table(TEXTS) else {
@@ -390,14 +418,14 @@ impl Store {
     }
 
     fn read_blob(&self, def: TableDefinition<u64, &[u8]>, id: i64) -> Option<Vec<u8>> {
-        let rtx = self.db.begin_read().ok()?;
+        let rtx = self.db().begin_read().ok()?;
         let t = rtx.open_table(def).ok()?;
         let v = t.get(id as u64).ok()??.value().to_vec();
         Some(v)
     }
 
     pub fn get_text(&self, id: i64) -> Option<String> {
-        let rtx = self.db.begin_read().ok()?;
+        let rtx = self.db().begin_read().ok()?;
         let t = rtx.open_table(TEXTS).ok()?;
         let v = t.get(id as u64).ok()??.value().to_string();
         Some(v)
@@ -425,7 +453,7 @@ impl Store {
             return 0;
         }
         let run = || -> DbResult<usize> {
-            let tx = self.db.begin_write()?;
+            let tx = self.db().begin_write()?;
             let mut removed = 0;
             {
                 let mut meta = tx.open_table(META)?;
@@ -458,7 +486,11 @@ impl Store {
             tx.commit()?;
             Ok(removed)
         };
-        run().unwrap_or(0)
+        let removed = run().unwrap_or(0);
+        if removed > 0 {
+            self.compact_later();
+        }
+        removed
     }
 
     pub fn delete(&self, id: i64) {
@@ -479,7 +511,7 @@ impl Store {
     /// Flip the pin flag; returns the new state.
     pub fn toggle_pin(&self, id: i64) -> Option<bool> {
         let run = || -> DbResult<Option<bool>> {
-            let tx = self.db.begin_write()?;
+            let tx = self.db().begin_write()?;
             let result = {
                 let mut meta = tx.open_table(META)?;
                 let old = meta.get(id as u64)?.and_then(|g| Meta::decode(g.value()));
@@ -576,6 +608,34 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_shrinks_after_clearing() {
+        let dir = std::env::temp_dir().join(format!("sf-compact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("c.redb");
+        let s = Store::open(&path).unwrap();
+        for n in 0..200u64 {
+            s.add_text(&format!("{n} {}", "x".repeat(20_000)), "", n + 1).unwrap();
+        }
+        let big = std::fs::metadata(&path).unwrap().len();
+        assert!(big > 2_000_000);
+        s.clear_unpinned();
+        // Compaction runs on a background thread right after the delete: wait for it.
+        let mut small = big;
+        for _ in 0..100 {
+            s.compact();
+            small = std::fs::metadata(&path).unwrap().len();
+            if small < big / 4 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(small < big / 4, "{small} vs {big}");
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn bulk_delete_is_not_capped_at_search_limit() {
