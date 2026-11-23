@@ -219,6 +219,7 @@ extern "system" {
     pub fn ShowWindow(h: HWND, cmd: i32) -> i32;
     pub fn IsWindowVisible(h: HWND) -> i32;
     pub fn IsWindow(h: HWND) -> i32;
+    pub fn GetAsyncKeyState(vk: i32) -> i16;
     pub fn GetClassNameW(h: HWND, buf: *mut u16, max: i32) -> i32;
     pub fn GetDlgItem(h: HWND, id: i32) -> HWND;
     pub fn FindWindowExW(parent: HWND, after: HWND, class: *const u16, title: *const u16) -> HWND;

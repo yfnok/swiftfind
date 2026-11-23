@@ -12,7 +12,7 @@ cargo build --release
 
 产物：`target\release\swiftfind.exe`（单文件，无需 DLL）。也可以把项目推到 GitHub，用 `.github/workflows/build.yml` 自动构建。
 
-首次运行建议先 `cargo test`，纯逻辑部分（排序、学习、匹配、剪贴板、IPC 解析、热键解析）有 112 个单元测试。
+首次运行建议先 `cargo test`，纯逻辑部分（排序、学习、匹配、剪贴板、IPC 解析、热键解析）有 113 个单元测试。
 
 ## 使用
 

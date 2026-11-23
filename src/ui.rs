@@ -152,6 +152,8 @@ pub struct App {
     ui_new_exclude: String,
     ui_autostart: bool,
     recording: Option<HotkeyTarget>,
+    /// The "needs a modifier" hint was shown for the key currently held.
+    rec_hinted: bool,
     rec_win: bool,
     hotkey_warned: bool,
 
@@ -327,6 +329,7 @@ impl App {
             ui_new_exclude: String::new(),
             ui_autostart: platform::autostart_enabled(),
             recording: None,
+            rec_hinted: false,
             rec_win: false,
             hotkey_warned: false,
             clip_settings,
@@ -816,6 +819,27 @@ impl App {
 
     /// While recording, swallow every key and turn the first valid combination into a hotkey.
     fn capture_hotkey(&mut self, ctx: &egui::Context, target: HotkeyTarget) {
+        // Poll the physical keyboard: it works for every combination (Alt+Space, Win+…, keys that
+        // Windows turns into menu commands), and keep repainting so the poll keeps running.
+        ctx.request_repaint_after(Duration::from_millis(30));
+        match platform::poll_recording(self.rec_win) {
+            platform::RecPoll::Cancel => {
+                self.stop_recording();
+                return;
+            }
+            platform::RecPoll::Combo(h) => {
+                self.set_hotkey(target, h.clone());
+                self.toast(format!("快捷键已设为 {h}"));
+                return;
+            }
+            platform::RecPoll::NeedModifier => {
+                if !self.rec_hinted {
+                    self.rec_hinted = true;
+                    self.toast("需要至少一个修饰键 (Ctrl / Alt / Shift / Win) 加一个主键");
+                }
+            }
+            platform::RecPoll::Nothing => self.rec_hinted = false,
+        }
         let events: Vec<egui::Event> = ctx.input(|i| i.events.clone());
         let mut done: Option<String> = None;
         let mut cancel = false;

@@ -157,6 +157,78 @@ pub fn parse_hotkey(s: &str) -> Result<(u32, u32), String> {
     }
 }
 
+/// Hotkey name (as `parse_hotkey` reads it) of a non-modifier virtual key, if it may be a hotkey.
+pub fn vk_name(vk: u32) -> Option<String> {
+    Some(match vk {
+        0x09 => "Tab".into(),
+        0x0D => "Enter".into(),
+        0x1B => "Esc".into(),
+        0x20 => "Space".into(),
+        0x21 => "PageUp".into(),
+        0x22 => "PageDown".into(),
+        0x23 => "End".into(),
+        0x24 => "Home".into(),
+        0x25 => "Left".into(),
+        0x26 => "Up".into(),
+        0x27 => "Right".into(),
+        0x28 => "Down".into(),
+        0x2D => "Insert".into(),
+        0x2E => "Delete".into(),
+        0x30..=0x39 | 0x41..=0x5A => (vk as u8 as char).to_string(),
+        0x70..=0x87 => format!("F{}", vk - 0x70 + 1),
+        0xBA => ";".into(),
+        0xBB => "=".into(),
+        0xBC => ",".into(),
+        0xBD => "-".into(),
+        0xBE => ".".into(),
+        0xBF => "/".into(),
+        0xC0 => "`".into(),
+        0xDB => "[".into(),
+        0xDC => "\\".into(),
+        0xDD => "]".into(),
+        0xDE => "'".into(),
+        _ => return None,
+    })
+}
+
+/// Result of looking at the physical keyboard while recording a hotkey.
+#[derive(Debug, PartialEq)]
+pub enum RecPoll {
+    Nothing,
+    Cancel,
+    NeedModifier,
+    Combo(String),
+}
+
+/// Look at the physical keyboard (independent of window focus quirks, Alt-menu handling, IME…).
+pub fn poll_recording(force_win: bool) -> RecPoll {
+    #[cfg(windows)]
+    unsafe {
+        let down = |vk: i32| (GetAsyncKeyState(vk) as u16) & 0x8000 != 0;
+        let (ctrl, alt, shift) = (down(0x11), down(0x12), down(0x10));
+        let win = force_win || down(0x5B) || down(0x5C);
+        let main = (0x08u32..=0xDE).find(|&vk| vk_name(vk).is_some() && down(vk as i32));
+        let Some(vk) = main else {
+            return RecPoll::Nothing;
+        };
+        if vk == 0x1B && !(ctrl || alt || shift) {
+            return RecPoll::Cancel;
+        }
+        if !(ctrl || alt || shift || win) {
+            return RecPoll::NeedModifier;
+        }
+        return match vk_name(vk).and_then(|n| compose_hotkey(ctrl, alt, shift, win, &n)) {
+            Some(h) => RecPoll::Combo(h),
+            None => RecPoll::NeedModifier,
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = force_win;
+        RecPoll::Nothing
+    }
+}
+
 /// Build a canonical hotkey string from recorded modifiers and a key name (egui `Key::name()`).
 /// Returns `None` when the result would not be a valid global hotkey.
 pub fn compose_hotkey(ctrl: bool, alt: bool, shift: bool, win: bool, key: &str) -> Option<String> {
@@ -918,6 +990,16 @@ pub use imp::*;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_recordable_key_parses() {
+        for vk in 0u32..=0xFF {
+            if let Some(n) = vk_name(vk) {
+                let (m, v) = parse_hotkey(&format!("Ctrl+{n}")).unwrap_or_else(|e| panic!("{vk:#x} {n}: {e}"));
+                assert_eq!((m, v), (MOD_CONTROL, vk), "{n}");
+            }
+        }
+    }
 
     #[test]
     fn dropfiles_layout() {
