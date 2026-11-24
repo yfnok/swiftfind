@@ -44,6 +44,9 @@ pub struct Shared {
     /// While the user is recording a new hotkey, global hotkeys are released so that pressing the
     /// current combination is captured by the recorder instead of toggling the window.
     pub suspended: AtomicBool,
+    /// A re-registration request that must not be lost if the hotkey thread has not entered its
+    /// message loop yet. The loop consumes this flag in addition to handling its wake message.
+    pub hotkey_dirty: AtomicBool,
     /// Query to pre-fill the next time the window is shown (set by the clipboard hotkey).
     pub pending_query: Mutex<Option<String>>,
     /// Remembered window position (top-left) after the user dragged it; `None` = centered.
@@ -70,6 +73,7 @@ impl Shared {
             hotkey_error: Mutex::new(None),
             clip_hotkey_error: Mutex::new(None),
             suspended: AtomicBool::new(false),
+            hotkey_dirty: AtomicBool::new(false),
             pending_query: Mutex::new(None),
             saved_pos: Mutex::new(None),
             dialog_hwnd: AtomicIsize::new(0),
@@ -915,6 +919,9 @@ mod imp {
 
     /// Ask the hotkey thread to re-read `shared.hotkey` and register it.
     pub fn reapply_hotkey(shared: &Shared) {
+        // PostThreadMessage can fail before the target thread has made its message queue. Keep a
+        // durable request as well; the hotkey thread checks it on its timer tick.
+        shared.hotkey_dirty.store(true, Ordering::SeqCst);
         let tid = shared.hotkey_tid.load(Ordering::SeqCst);
         if tid != 0 {
             unsafe {
@@ -927,6 +934,10 @@ mod imp {
         std::thread::Builder::new()
             .name("hotkey-tray".into())
             .spawn(move || unsafe {
+                // Explicitly create this thread's message queue before publishing its id. Without
+                // this, an early settings change can lose its PostThreadMessage wake-up.
+                let mut bootstrap = MSG::default();
+                PeekMessageW(&mut bootstrap, 0, 0, 0, 0);
                 shared
                     .hotkey_tid
                     .store(GetCurrentThreadId(), Ordering::SeqCst);
@@ -1002,6 +1013,10 @@ mod imp {
                                 if shared.game_paused.swap(want, Ordering::SeqCst) != want {
                                     apply_hotkey(&shared);
                                 }
+                                if shared.hotkey_dirty.swap(false, Ordering::SeqCst) {
+                                    apply_hotkey(&shared);
+                                    wake();
+                                }
                             });
                         }
                         WM_HOTKEY => {
@@ -1020,8 +1035,10 @@ mod imp {
                         }
                         m if m == WM_APP + 1 => {
                             crate::log::guarded("hotkey re-register", || {
-                                apply_hotkey(&shared);
-                                wake();
+                                if shared.hotkey_dirty.swap(false, Ordering::SeqCst) {
+                                    apply_hotkey(&shared);
+                                    wake();
+                                }
                             });
                         }
                         _ => {
