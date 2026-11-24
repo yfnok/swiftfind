@@ -9,6 +9,19 @@ use std::sync::{Arc, Mutex};
 
 pub const WINDOW_TITLE: &str = "SwiftFind";
 
+#[derive(Clone, Debug)]
+pub struct WindowInfo {
+    pub hwnd: isize,
+    pub title: String,
+    pub process: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProcessInfo {
+    pub pid: u32,
+    pub name: String,
+}
+
 /// State shared between the UI thread and the hotkey/tray thread.
 pub struct Shared {
     /// The launcher window is currently on screen.
@@ -334,6 +347,151 @@ mod imp {
         let _ = std::process::Command::new("explorer.exe")
             .raw_arg(format!("/select,\"{}\"", path))
             .spawn();
+    }
+
+    fn process_name(pid: u32) -> String {
+        let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if h == 0 { return String::new(); }
+        let mut buf = [0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = unsafe { QueryFullProcessImageNameW(h, 0, buf.as_mut_ptr(), &mut len) } != 0;
+        unsafe { CloseHandle(h); }
+        if !ok { return String::new(); }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string()
+    }
+
+    unsafe extern "system" fn collect_windows(hwnd: HWND, param: LPARAM) -> i32 {
+        if IsWindowVisible(hwnd) == 0 || GetWindow(hwnd, GW_OWNER) != 0 || GetWindowTextLengthW(hwnd) == 0 {
+            return 1;
+        }
+        let len = GetWindowTextLengthW(hwnd) as usize;
+        let mut buf = vec![0u16; len + 1];
+        let read = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+        if read <= 0 { return 1; }
+        let title = String::from_utf16_lossy(&buf[..read as usize]).trim().to_string();
+        if title.is_empty() || title == WINDOW_TITLE { return 1; }
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        let list = &mut *(param as *mut Vec<WindowInfo>);
+        list.push(WindowInfo { hwnd, title, process: process_name(pid) });
+        1
+    }
+
+    pub fn windows() -> Vec<WindowInfo> {
+        let mut out = Vec::new();
+        unsafe { EnumWindows(Some(collect_windows), &mut out as *mut _ as LPARAM); }
+        out
+    }
+
+    pub fn activate_window(hwnd: isize) -> bool {
+        unsafe {
+            if IsWindow(hwnd) == 0 || IsWindowEnabled(hwnd) == 0 { return false; }
+            if IsIconic(hwnd) != 0 { ShowWindowAsync(hwnd, SW_RESTORE); }
+            BringWindowToTop(hwnd);
+            SetForegroundWindow(hwnd) != 0
+        }
+    }
+
+    pub fn processes() -> Vec<ProcessInfo> {
+        let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+        if snap == -1isize { return Vec::new(); }
+        let mut entry: PROCESSENTRY32W = unsafe { std::mem::zeroed() };
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut out = Vec::new();
+        let mut ok = unsafe { Process32FirstW(snap, &mut entry) } != 0;
+        while ok {
+            let end = entry.szExeFile.iter().position(|&c| c == 0).unwrap_or(entry.szExeFile.len());
+            let name = String::from_utf16_lossy(&entry.szExeFile[..end]);
+            if !name.is_empty() { out.push(ProcessInfo { pid: entry.th32ProcessID, name }); }
+            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+            ok = unsafe { Process32NextW(snap, &mut entry) } != 0;
+        }
+        unsafe { CloseHandle(snap); }
+        out
+    }
+
+    pub fn kill_process(pid: u32) -> Result<(), String> {
+        let h = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        if h == 0 { return Err(format!("无法结束 PID {pid}（可能需要管理员权限）")); }
+        let ok = unsafe { TerminateProcess(h, 1) } != 0;
+        unsafe { CloseHandle(h); }
+        ok.then_some(()).ok_or_else(|| format!("无法结束 PID {pid}"))
+    }
+
+    const IID_ISHELL_FOLDER: GUID = GUID { data1: 0x0002_14e6, data2: 0, data3: 0, data4: [0xc0, 0, 0, 0, 0, 0, 0, 0x46] };
+    const IID_ICONTEXT_MENU: GUID = GUID { data1: 0x0002_14e4, data2: 0, data3: 0, data4: [0xc0, 0, 0, 0, 0, 0, 0, 0x46] };
+    const TPM_RIGHTBUTTON: u32 = 0x0002;
+    const TPM_RETURNCMD: u32 = 0x0100;
+
+    unsafe fn release_com(object: *mut std::ffi::c_void) {
+        if object.is_null() { return; }
+        let vtbl = *(object as *mut *mut *const std::ffi::c_void);
+        let release: unsafe extern "system" fn(*mut std::ffi::c_void) -> u32 = std::mem::transmute(*vtbl.add(2));
+        release(object);
+    }
+
+    /// Ask Explorer's `IContextMenu` implementation to display its real menu for one item.
+    /// This keeps extensions such as 7-Zip, Send to, Properties and third-party handlers intact.
+    pub fn show_shell_context_menu(owner: isize, path: &str) -> Result<(), String> {
+        unsafe {
+            let hr = CoInitializeEx(std::ptr::null_mut(), 2); // COINIT_APARTMENTTHREADED
+            let uninit = hr >= 0;
+            let wide_path = wide(path);
+            let mut pidl: *mut std::ffi::c_void = std::ptr::null_mut();
+            let parsed = SHParseDisplayName(wide_path.as_ptr(), std::ptr::null_mut(), &mut pidl, 0, std::ptr::null_mut());
+            if parsed < 0 || pidl.is_null() {
+                if uninit { CoUninitialize(); }
+                return Err("无法为该文件创建资源管理器菜单".into());
+            }
+            let mut folder: *mut std::ffi::c_void = std::ptr::null_mut();
+            let mut child: *const std::ffi::c_void = std::ptr::null();
+            let bound = SHBindToParent(pidl, &IID_ISHELL_FOLDER, &mut folder, &mut child);
+            if bound < 0 || folder.is_null() || child.is_null() {
+                CoTaskMemFree(pidl);
+                if uninit { CoUninitialize(); }
+                return Err("无法获取资源管理器菜单".into());
+            }
+            let folder_vtbl = *(folder as *mut *mut *const std::ffi::c_void);
+            type GetUiObjectOf = unsafe extern "system" fn(*mut std::ffi::c_void, HWND, u32, *const *const std::ffi::c_void, *const GUID, *mut u32, *mut *mut std::ffi::c_void) -> i32;
+            let get_ui: GetUiObjectOf = std::mem::transmute(*folder_vtbl.add(10));
+            let mut menu_obj: *mut std::ffi::c_void = std::ptr::null_mut();
+            let got = get_ui(folder, owner, 1, &child, &IID_ICONTEXT_MENU, std::ptr::null_mut(), &mut menu_obj);
+            release_com(folder);
+            CoTaskMemFree(pidl);
+            if got < 0 || menu_obj.is_null() {
+                if uninit { CoUninitialize(); }
+                return Err("该文件不提供资源管理器菜单".into());
+            }
+            let menu = CreatePopupMenu();
+            if menu == 0 {
+                release_com(menu_obj);
+                if uninit { CoUninitialize(); }
+                return Err("无法创建菜单".into());
+            }
+            let menu_vtbl = *(menu_obj as *mut *mut *const std::ffi::c_void);
+            type QueryContextMenu = unsafe extern "system" fn(*mut std::ffi::c_void, isize, u32, u32, u32, u32) -> i32;
+            let query: QueryContextMenu = std::mem::transmute(*menu_vtbl.add(3));
+            let populated = query(menu_obj, menu, 0, 1, 0x7fff, 0);
+            if populated < 0 {
+                DestroyMenu(menu); release_com(menu_obj); if uninit { CoUninitialize(); }
+                return Err("无法加载资源管理器菜单".into());
+            }
+            let mut point = POINT::default();
+            GetCursorPos(&mut point);
+            ShowWindow(owner, SW_HIDE);
+            let command = TrackPopupMenuEx(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, point.x, point.y, owner, std::ptr::null());
+            if command != 0 {
+                type InvokeCommand = unsafe extern "system" fn(*mut std::ffi::c_void, *const CMINVOKECOMMANDINFO) -> i32;
+                let invoke: InvokeCommand = std::mem::transmute(*menu_vtbl.add(4));
+                let info = CMINVOKECOMMANDINFO { cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32, fMask: 0, hwnd: owner, lpVerb: (command - 1) as usize as *const i8, lpParameters: std::ptr::null(), lpDirectory: std::ptr::null(), nShow: SW_SHOWNORMAL, dwHotKey: 0, hIcon: 0 };
+                let _ = invoke(menu_obj, &info);
+            }
+            DestroyMenu(menu);
+            release_com(menu_obj);
+            if uninit { CoUninitialize(); }
+            Ok(())
+        }
     }
 
     unsafe fn alloc_global(bytes: &[u8]) -> isize {
@@ -931,6 +1089,11 @@ mod imp {
         Err(format!("仅支持 Windows (无法打开 {target})"))
     }
     pub fn reveal_in_explorer(_path: &str) {}
+    pub fn windows() -> Vec<WindowInfo> { Vec::new() }
+    pub fn processes() -> Vec<ProcessInfo> { Vec::new() }
+    pub fn activate_window(_hwnd: isize) -> bool { false }
+    pub fn kill_process(_pid: u32) -> Result<(), String> { Err("仅支持 Windows".into()) }
+    pub fn show_shell_context_menu(_owner: isize, _path: &str) -> Result<(), String> { Err("仅支持 Windows".into()) }
     pub fn set_clip_files(_paths: &[String]) -> bool {
         false
     }

@@ -16,6 +16,7 @@ pub const WM_USER: u32 = 0x0400;
 pub const WM_APP: u32 = 0x8000;
 pub const WM_QUIT: u32 = 0x0012;
 pub const WM_TIMER: u32 = 0x0113;
+pub const GW_OWNER: u32 = 4;
 pub const GWL_STYLE: i32 = -16;
 pub const WS_CAPTION: u32 = 0x00C0_0000;
 pub const WM_SETTEXT: u32 = 0x000C;
@@ -32,6 +33,7 @@ pub const MOD_NOREPEAT: u32 = 0x4000;
 pub const SW_HIDE: i32 = 0;
 pub const SW_SHOW: i32 = 5;
 pub const SW_SHOWNORMAL: i32 = 1;
+pub const SW_RESTORE: i32 = 9;
 
 pub const SWP_NOSIZE: u32 = 0x0001;
 pub const SWP_SHOWWINDOW: u32 = 0x0040;
@@ -130,6 +132,41 @@ pub struct MSG {
     pub pt: POINT,
 }
 
+#[repr(C)]
+pub struct PROCESSENTRY32W {
+    pub dwSize: u32,
+    pub cntUsage: u32,
+    pub th32ProcessID: u32,
+    pub th32DefaultHeapID: usize,
+    pub th32ModuleID: u32,
+    pub cntThreads: u32,
+    pub th32ParentProcessID: u32,
+    pub pcPriClassBase: i32,
+    pub dwFlags: u32,
+    pub szExeFile: [u16; 260],
+}
+
+#[repr(C)]
+pub struct GUID {
+    pub data1: u32,
+    pub data2: u16,
+    pub data3: u16,
+    pub data4: [u8; 8],
+}
+
+#[repr(C)]
+pub struct CMINVOKECOMMANDINFO {
+    pub cbSize: u32,
+    pub fMask: u32,
+    pub hwnd: HWND,
+    pub lpVerb: *const i8,
+    pub lpParameters: *const i8,
+    pub lpDirectory: *const i8,
+    pub nShow: i32,
+    pub dwHotKey: u32,
+    pub hIcon: isize,
+}
+
 impl Default for MSG {
     fn default() -> Self {
         Self {
@@ -219,6 +256,16 @@ extern "system" {
     pub fn ShowWindow(h: HWND, cmd: i32) -> i32;
     pub fn IsWindowVisible(h: HWND) -> i32;
     pub fn IsWindow(h: HWND) -> i32;
+    pub fn IsWindowEnabled(h: HWND) -> i32;
+    pub fn IsIconic(h: HWND) -> i32;
+    pub fn ShowWindowAsync(h: HWND, cmd: i32) -> i32;
+    pub fn EnumWindows(proc: Option<unsafe extern "system" fn(HWND, LPARAM) -> i32>, param: LPARAM) -> i32;
+    pub fn GetWindowTextLengthW(h: HWND) -> i32;
+    pub fn GetWindowTextW(h: HWND, buf: *mut u16, max: i32) -> i32;
+    pub fn GetWindow(h: HWND, cmd: u32) -> HWND;
+    pub fn CreatePopupMenu() -> isize;
+    pub fn DestroyMenu(menu: isize) -> i32;
+    pub fn TrackPopupMenuEx(menu: isize, flags: u32, x: i32, y: i32, hwnd: HWND, params: *const c_void) -> u32;
     pub fn GetAsyncKeyState(vk: i32) -> i16;
     pub fn GetClassNameW(h: HWND, buf: *mut u16, max: i32) -> i32;
     pub fn GetDlgItem(h: HWND, id: i32) -> HWND;
@@ -263,6 +310,8 @@ extern "system" {
 #[link(name = "ole32")]
 extern "system" {
     pub fn CoInitializeEx(reserved: *mut c_void, coinit: u32) -> i32;
+    pub fn CoUninitialize();
+    pub fn CoTaskMemFree(mem: *mut c_void);
 }
 
 #[link(name = "kernel32")]
@@ -281,6 +330,10 @@ extern "system" {
     pub fn GlobalSize(mem: isize) -> usize;
     pub fn OpenProcess(access: u32, inherit: i32, pid: u32) -> isize;
     pub fn CloseHandle(h: isize) -> i32;
+    pub fn CreateToolhelp32Snapshot(flags: u32, process_id: u32) -> isize;
+    pub fn Process32FirstW(snapshot: isize, entry: *mut PROCESSENTRY32W) -> i32;
+    pub fn Process32NextW(snapshot: isize, entry: *mut PROCESSENTRY32W) -> i32;
+    pub fn TerminateProcess(process: isize, exit_code: u32) -> i32;
     pub fn QueryFullProcessImageNameW(
         process: isize,
         flags: u32,
@@ -290,6 +343,8 @@ extern "system" {
 }
 
 pub const ERROR_ALREADY_EXISTS: u32 = 183;
+pub const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+pub const PROCESS_TERMINATE: u32 = 0x0001;
 
 #[link(name = "shell32")]
 extern "system" {
@@ -302,6 +357,8 @@ extern "system" {
         dir: *const u16,
         show: i32,
     ) -> isize;
+    pub fn SHParseDisplayName(name: *const u16, bind_ctx: *mut c_void, pidl: *mut *mut c_void, attrs: u32, sfgao: *mut u32) -> i32;
+    pub fn SHBindToParent(pidl: *const c_void, riid: *const GUID, parent: *mut *mut c_void, child: *mut *const c_void) -> i32;
 }
 
 /// UTF-8 → null-terminated UTF-16.

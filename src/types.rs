@@ -11,6 +11,8 @@ pub enum Kind {
     Web,
     Clip,
     Snippet,
+    Window,
+    Process,
 }
 
 impl Kind {
@@ -25,6 +27,8 @@ impl Kind {
             Kind::Web => "网页",
             Kind::Clip => "剪贴板",
             Kind::Snippet => "片段",
+            Kind::Window => "窗口",
+            Kind::Process => "进程",
         }
     }
 }
@@ -44,6 +48,10 @@ pub enum Action {
     PasteClip { id: i64, image: bool },
     /// Paste a text snippet (variables like `{date}` are expanded at paste time).
     PasteText(String),
+    /// Bring an existing top-level window to the foreground.
+    ActivateWindow(isize),
+    /// Terminate a process selected through the `kill` query.
+    KillProcess { pid: u32, name: String },
     /// Quit the app.
     Quit,
     /// Open this app's settings panel.

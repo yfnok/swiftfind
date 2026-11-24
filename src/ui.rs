@@ -79,6 +79,8 @@ fn kind_color(k: Kind) -> Color32 {
         Kind::Web => Color32::from_rgb(244, 114, 182),
         Kind::Clip => Color32::from_rgb(110, 205, 130),
         Kind::Snippet => Color32::from_rgb(250, 204, 21),
+        Kind::Window => Color32::from_rgb(75, 192, 192),
+        Kind::Process => Color32::from_rgb(248, 113, 113),
     }
 }
 
@@ -90,6 +92,7 @@ enum Mode {
     CopyPath,
     Terminal,
     CopyText,
+    ContextMenu,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -150,7 +153,6 @@ pub struct App {
     panel_open: bool,
     ui_everything_path: String,
     ui_new_exclude: String,
-    ui_autostart: bool,
     recording: Option<HotkeyTarget>,
     /// The "needs a modifier" hint was shown for the key currently held.
     rec_hinted: bool,
@@ -327,7 +329,6 @@ impl App {
             panel_open: false,
             ui_everything_path: cfg.everything_path.clone(),
             ui_new_exclude: String::new(),
-            ui_autostart: platform::autostart_enabled(),
             recording: None,
             rec_hinted: false,
             rec_win: false,
@@ -622,7 +623,7 @@ impl App {
 
         // Dangerous commands need a second Enter.
         if matches!(mode, Mode::Normal | Mode::Admin) {
-            let needs_confirm = item
+            let needs_confirm = matches!(item.action, Action::KillProcess { .. }) || item
                 .id
                 .strip_prefix("cmd:")
                 .and_then(|n| {
@@ -702,6 +703,15 @@ impl App {
                 }
                 return;
             }
+            Mode::ContextMenu => {
+                if let Some(p) = &item.path {
+                    match platform::show_shell_context_menu(self.shared.hwnd.load(Ordering::Relaxed), p) {
+                        Ok(()) => self.hide(),
+                        Err(e) => self.toast(e),
+                    }
+                }
+                return;
+            }
             _ => {}
         }
         // Inside an Open/Save dialog, files and folders navigate the dialog instead of opening.
@@ -772,6 +782,13 @@ impl App {
                     self.copy_clip(ctx, c);
                 }
             }
+            Action::ActivateWindow(hwnd) => {
+                if platform::activate_window(*hwnd) { self.hide(); } else { self.toast("窗口已关闭或无法切换"); }
+            }
+            Action::KillProcess { pid, name } => match platform::kill_process(*pid) {
+                Ok(()) => { self.toast(format!("已结束 {name}")); self.dirty = true; }
+                Err(e) => self.toast(e),
+            },
             Action::Quit => std::process::exit(0),
             Action::OpenPanel => {
                 self.panel_open = true;
@@ -898,6 +915,7 @@ impl App {
         let mut exclude_sel = false;
         let mut forget_sel = false;
         let mut bulk_del = false;
+        let mut context_menu = false;
         let mut copy_file = false;
         let text_selected = egui::text_edit::TextEditState::load(ctx, egui::Id::new("query"))
             .and_then(|s| s.cursor.char_range())
@@ -965,7 +983,7 @@ impl App {
                 (Key::Num8, 7),
                 (Key::Num9, 8),
             ] {
-                if i.consume_key(Modifiers::CTRL, k) {
+                if i.consume_key(Modifiers::ALT, k) {
                     act = Some((idx, Mode::Normal));
                 }
             }
@@ -981,6 +999,9 @@ impl App {
             }
             if i.consume_key(Modifiers::CTRL, Key::T) {
                 act = Some((self.selected, Mode::Terminal));
+            }
+            if i.consume_key(Modifiers::SHIFT, Key::F10) || i.consume_key(Modifiers::ALT, Key::Enter) {
+                context_menu = true;
             }
             if i.consume_key(Modifiers::CTRL, Key::D) {
                 exclude_sel = true;
@@ -1000,6 +1021,9 @@ impl App {
         }
         if self.panel_open {
             return;
+        }
+        if context_menu && matches!(self.results.get(self.selected).map(|i| i.kind), Some(Kind::File | Kind::Folder)) {
+            act = Some((self.selected, Mode::ContextMenu));
         }
         if let Some(d) = moved {
             if n > 0 {
@@ -1445,6 +1469,12 @@ impl App {
                             ui.close();
                         }
                         if item.path.is_some() {
+                            if matches!(item.kind, Kind::File | Kind::Folder)
+                                && ui.button("资源管理器右键菜单  (Shift+F10 / Alt+Enter)").clicked()
+                            {
+                                ctx_action = Some((idx, Mode::ContextMenu));
+                                ui.close();
+                            }
                             if ui.button("打开所在文件夹  (Shift+Enter)").clicked() {
                                 ctx_action = Some((idx, Mode::Reveal));
                                 ui.close();
@@ -1613,9 +1643,6 @@ impl App {
             if ui.checkbox(&mut self.engine.cfg.show_recent_on_empty, "输入为空时显示常用项目 (默认关闭，只显示搜索框)").changed() {
                 changed = true;
                 self.dirty = true;
-            }
-            if ui.checkbox(&mut self.ui_autostart, "开机自启动").changed() {
-                platform::set_autostart(self.ui_autostart);
             }
             ui.horizontal(|ui| {
                 changed |= ui.checkbox(&mut self.engine.cfg.show_files, "搜索文件").changed();

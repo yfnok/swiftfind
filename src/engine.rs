@@ -697,9 +697,24 @@ impl Engine {
         if let Some(items) = self.clipboard_view(q) {
             return items;
         }
+        if let Some(name) = q.strip_prefix("kill ").map(str::trim).filter(|s| !s.is_empty()) {
+            return self.process_view(name);
+        }
         let qn = normalize_query(q);
         let tokens: Vec<&str> = qn.split(' ').collect();
         let mut out: Vec<Item> = Vec::with_capacity(64);
+
+        // Typing a window title (for example "微信") switches to it directly.
+        for w in crate::platform::windows() {
+            let hay = Haystack::new(&w.title, &format!("{} {}", w.process, crate::py::keywords(&w.title)));
+            if let Some(score) = matcher::score(&hay, &tokens) {
+                out.push(Item {
+                    id: format!("window:{}", w.hwnd), title: w.title, subtitle: w.process,
+                    kind: Kind::Window, action: Action::ActivateWindow(w.hwnd), path: None,
+                    score: 80.0 + score,
+                });
+            }
+        }
 
         // Calculator.
         if let Some(v) = crate::calc::eval(q) {
@@ -889,6 +904,22 @@ impl Engine {
                 });
             }
         }
+        out
+    }
+
+    fn process_view(&self, query: &str) -> Vec<Item> {
+        let qn = normalize_query(query);
+        let tokens: Vec<&str> = qn.split_whitespace().collect();
+        let mut out: Vec<Item> = crate::platform::processes().into_iter().filter_map(|p| {
+            let score = matcher::score(&Haystack::new(&p.name, ""), &tokens)?;
+            Some(Item {
+                id: format!("process:{}", p.pid), title: p.name.clone(),
+                subtitle: format!("PID {} · Enter 结束进程", p.pid), kind: Kind::Process,
+                action: Action::KillProcess { pid: p.pid, name: p.name }, path: None, score,
+            })
+        }).collect();
+        out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        out.truncate(MAX_RESULTS);
         out
     }
 
